@@ -9,6 +9,7 @@ import {
 } from "./config.ts";
 import { LocalBackend } from "./exec/local.ts";
 import {
+  MCP_TOOL_PREFIX,
   needsApproval,
   permissionForSessionMode,
   SESSION_MODE_LABELS,
@@ -21,6 +22,9 @@ import {
   type LoopProgress,
   type ToolCall,
 } from "./loop.ts";
+import { McpManager } from "./mcp/manager.ts";
+import { formatSkillList, listSkills } from "./skills.ts";
+import { formatTodoList, type TodoItem } from "./todos.ts";
 import {
   getModel,
   listOpenRouterModels,
@@ -83,13 +87,16 @@ function startStatusLine(initial = "Running"): { update: (text: string) => void;
   };
 }
 
-const VERSION = "0.2.3";
+const VERSION = "0.3.0";
 const FOOTER_ROWS = 3; // full-width rule + status + bottom bar
 
 const SLASH_COMMANDS: Array<{ cmd: string; help: string }> = [
   { cmd: "/help", help: "show commands" },
   { cmd: "/setup", help: "configure OpenRouter or Ollama" },
   { cmd: "/status", help: "model, mode, context, cwd" },
+  { cmd: "/todos", help: "show the current task list" },
+  { cmd: "/mcp", help: "list configured MCP servers/tools/status" },
+  { cmd: "/skills", help: "list available skill files" },
   { cmd: "/model", help: "show / pin active model" },
   { cmd: "/model auto", help: "route per prompt" },
   { cmd: "/models", help: "list catalog" },
@@ -167,7 +174,9 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
   let config = initialConfig;
   const cwd = process.cwd();
   const backend = new LocalBackend(cwd);
+  const mcp = new McpManager(config.mcpServers ?? {});
   const history: ChatMessage[] = [];
+  const todos: TodoItem[] = [];
   const usage: SessionUsage = emptySessionUsage();
   let lastDone = "";
   let turnBusy = false;
@@ -296,6 +305,7 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
     clearBelowInput();
     rl.close();
     await backend.close();
+    await mcp.close();
     await printUsage(usage, config, history);
   };
 
@@ -329,9 +339,11 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
           await saveConfig(config);
         },
         history,
+        todos,
         usage,
         cwd,
         rl,
+        mcp,
       });
       if (done === "exit") break;
       showIdle();
@@ -340,7 +352,7 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
 
     try {
       turnBusy = true;
-      lastDone = await runTurn(text, config, backend, history, usage, rl);
+      lastDone = await runTurn(text, config, backend, mcp, history, todos, usage, rl, cwd);
     } catch (error) {
       console.error(error instanceof Error ? error.message : error);
       lastDone = "error";
@@ -423,6 +435,12 @@ function printSlashMenu(): void {
   console.log("");
   console.log(paint(ansi.muted, "Modes (⌃T or ⇧Tab): automatic → manual → ask on edit → plan"));
   console.log(paint(ansi.muted, "Warp tip: Shift+Tab is often broken — use Ctrl+T to cycle."));
+  console.log(
+    paint(
+      ansi.muted,
+      "Agent tools: edit_file (patch-style edits), ranged read_file, git_status/diff/log/commit, run_tests, todo_write — see /todos. delegate spawns a capped, isolated subagent for bounded work. External MCP servers (see /mcp) add more tools, namespaced mcp__<server>__<tool>. skill loads a markdown file from .harnes/skills/ — see /skills and docs/skills.md."
+    )
+  );
 }
 
 function printWelcome(cwd: string): void {
@@ -529,9 +547,11 @@ async function handleSlash(
     getConfig: () => HarnesConfig;
     setConfig: (config: HarnesConfig) => Promise<void>;
     history: ChatMessage[];
+    todos: TodoItem[];
     usage: SessionUsage;
     cwd: string;
     rl: readline.Interface;
+    mcp: McpManager;
   }
 ): Promise<"ok" | "exit"> {
   const [cmd, ...rest] = text.slice(1).split(/\s+/);
@@ -548,9 +568,25 @@ async function handleSlash(
       return "ok";
     case "clear":
       ctx.history.length = 0;
+      ctx.todos.length = 0;
       Object.assign(ctx.usage, emptySessionUsage());
       console.log(paint(ansi.muted, "Session cleared (context + session cost reset)."));
       return "ok";
+    case "todos":
+      if (ctx.todos.length === 0) {
+        console.log(paint(ansi.muted, "No todos yet. The agent creates them for multi-step tasks."));
+      } else {
+        console.log(formatTodoList(ctx.todos));
+      }
+      return "ok";
+    case "mcp":
+      await printMcpStatus(ctx.mcp);
+      return "ok";
+    case "skills": {
+      const skills = await listSkills(ctx.cwd);
+      console.log(formatSkillList(skills));
+      return "ok";
+    }
     case "models":
       await listModels(ctx.getConfig());
       return "ok";
@@ -562,7 +598,7 @@ async function handleSlash(
       await printUsage(ctx.usage, ctx.getConfig(), ctx.history);
       return "ok";
     case "status": {
-      printFullStatus(ctx.getConfig(), ctx.history, ctx.cwd, ctx.usage);
+      printFullStatus(ctx.getConfig(), ctx.history, ctx.cwd, ctx.usage, ctx.todos);
       return "ok";
     }
     case "update":
@@ -641,6 +677,31 @@ async function handleUpdateCommand(
   }
 }
 
+async function printMcpStatus(mcp: McpManager): Promise<void> {
+  if (!mcp.enabled) {
+    console.log(paint(ansi.muted, "No MCP servers configured."));
+    console.log(
+      paint(
+        ansi.muted,
+        'Add one under "mcpServers" in ~/.config/harnes/config.json, e.g. { "mcpServers": { "docs": { "command": "npx", "args": ["-y", "some-mcp-server"] } } }'
+      )
+    );
+    return;
+  }
+  console.log(paint(ansi.accentBright, "MCP servers"));
+  const statuses = await mcp.describeStatus();
+  for (const server of statuses) {
+    if (server.status === "error") {
+      console.log(`  ${server.name.padEnd(16)} ${paint(ansi.warm, "error")} — ${server.detail}`);
+      continue;
+    }
+    console.log(`  ${server.name.padEnd(16)} ${paint(ansi.soft, "connected")} · ${server.tools.length} tool${server.tools.length === 1 ? "" : "s"}`);
+    for (const tool of server.tools) {
+      console.log(`    ${paint(ansi.cmd, `mcp__${server.name}__${tool.name}`)} ${paint(ansi.muted, `(${tool.class})`)}`);
+    }
+  }
+}
+
 async function listModels(config: HarnesConfig): Promise<void> {
   const session = resolveSession(config, []);
   const endpoint = resolveChatEndpoint(config);
@@ -711,6 +772,18 @@ function summarizeTool(call: ToolCall): string {
     return `bash ${cmd.length > 80 ? `${cmd.slice(0, 77)}…` : cmd}`;
   }
   if (call.name === "read_file") return `read_file ${call.arguments.path ?? ""}`;
+  if (call.name === "edit_file") return `edit_file ${call.arguments.path ?? ""}`;
+  if (call.name === "todo_write") return "todo_write (update task list)";
+  if (call.name === "git_status") return "git_status";
+  if (call.name === "git_diff") return `git_diff ${call.arguments.path ?? ""}`.trim();
+  if (call.name === "git_log") return "git_log";
+  if (call.name === "git_commit") return `git_commit ${JSON.stringify(call.arguments.message ?? "").slice(0, 60)}`;
+  if (call.name === "delegate") {
+    const mode = call.arguments.mode === "build" ? "build" : "plan";
+    const task = call.arguments.task ?? "";
+    return `delegate (${mode}) ${task.length > 60 ? `${task.slice(0, 57)}…` : task}`;
+  }
+  if (call.name.startsWith(MCP_TOOL_PREFIX)) return call.name;
   return `${call.name} ${JSON.stringify(call.arguments).slice(0, 60)}`;
 }
 
@@ -718,9 +791,12 @@ async function runTurn(
   prompt: string,
   config: HarnesConfig,
   backend: LocalBackend,
+  mcp: McpManager,
   history: ChatMessage[],
+  todos: TodoItem[],
   usage: SessionUsage,
-  rl: readline.Interface
+  rl: readline.Interface,
+  cwd: string
 ): Promise<string> {
   if (!hasUsableApiKey(config) && config.provider !== "ollama") {
     console.log("No API key configured. Run /setup first.");
@@ -740,13 +816,19 @@ async function runTurn(
       backend,
       permissionMode: session.permissionMode,
       history,
+      todos,
+      mcp: mcp.enabled ? mcp : undefined,
+      cwd,
+      hooks: config.hooks,
       complete: (input) => openaiCompatibleComplete(endpoint.baseUrl, endpoint.apiKey, input),
       onProgress: (event: LoopProgress) => {
         if (event.type === "thinking") status.update(`Thinking · step ${event.step}`);
+        else if (event.type === "subagent") status.update(`subagent: ${event.task}`);
         else status.update(`${event.name} · step ${event.step}`);
       },
       onApprove: async (call) => {
-        if (!needsApproval(mode, call.name)) return true;
+        const mcpClass = call.name.startsWith(MCP_TOOL_PREFIX) ? mcp.classify(call.name) : undefined;
+        if (!needsApproval(mode, call.name, mcpClass)) return true;
         status.stop();
         const answer = (await rl.question(paint(ansi.warm, `Allow ${summarizeTool(call)}? [y/N] `)))
           .trim()
@@ -823,7 +905,13 @@ async function printUsage(usage: SessionUsage, config: HarnesConfig, history: Ch
   }
 }
 
-function printFullStatus(config: HarnesConfig, history: ChatMessage[], cwd: string, usage: SessionUsage): void {
+function printFullStatus(
+  config: HarnesConfig,
+  history: ChatMessage[],
+  cwd: string,
+  usage: SessionUsage,
+  todos: TodoItem[]
+): void {
   const session = resolveSession(config, history);
   const endpoint = resolveChatEndpoint(config);
   console.log(`provider   ${endpoint.provider}`);
@@ -836,6 +924,10 @@ function printFullStatus(config: HarnesConfig, history: ChatMessage[], cwd: stri
   console.log(`cwd        ${shortCwd(cwd)}`);
   console.log(`history    ${history.length} messages`);
   console.log(`usage      turns=${usage.turns} tools=${usage.toolCalls} spend=${formatUsd(usage.costUsd)}`);
+  if (todos.length > 0) {
+    const done = todos.filter((item) => item.status === "completed").length;
+    console.log(`todos      ${done}/${todos.length} done · /todos for details`);
+  }
   console.log(`version    ${VERSION}`);
 }
 

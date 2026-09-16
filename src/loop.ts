@@ -1,6 +1,10 @@
-import { isToolAllowed, type ExecutionBackend, type PermissionMode } from "./exec/types.ts";
+import { isToolAllowed, mcpToolAllowed, MCP_TOOL_PREFIX, type ExecutionBackend, type PermissionMode } from "./exec/types.ts";
+import { runHooks, type HooksConfig } from "./hooks.ts";
+import type { McpToolProvider } from "./mcp/manager.ts";
 import type { ModelSpec } from "./models/catalog.ts";
 import { parseCompletionUsage, type CompletionUsage } from "./openrouter/usage.ts";
+import { formatSkillList, listSkills, loadSkill } from "./skills.ts";
+import { formatTodoList, parseTodoItems, setTodos, type TodoItem } from "./todos.ts";
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
@@ -33,19 +37,124 @@ export interface LoopResult {
   steps: number;
   stoppedReason: "complete" | "max-steps" | "denied-tool";
   usage: CompletionUsage;
+  /** Final todo list state after this turn (see `todos` input option). */
+  todos: TodoItem[];
 }
 
 export type LoopProgress =
   | { type: "thinking"; step: number }
-  | { type: "tool"; step: number; name: string };
+  | { type: "tool"; step: number; name: string }
+  | { type: "subagent"; step: number; task: string };
+
+/**
+ * Tools that must not run concurrently with siblings in the same step.
+ * When any call in a step names a tool from this set, the whole step falls
+ * back to serial execution (in model call order) rather than mixing modes.
+ * Empty today; a future tool with cross-call side effects (e.g. one that
+ * depends on another tool's output within the same step) should be added
+ * here instead of special-casing the scheduler.
+ */
+const SERIAL_ONLY_TOOLS = new Set<string>([]);
+
+/** Max number of tool calls from a single step executed concurrently. */
+const TOOL_CONCURRENCY_LIMIT = 6;
+
+/** Hard step cap for a `delegate` subagent's own loop, regardless of the parent's maxSteps. */
+const SUBAGENT_MAX_STEPS = 6;
+
+/** Hard wall-clock cap for a `delegate` subagent. Exceeding it abandons the child and reports a timeout to the parent. */
+export const SUBAGENT_TIMEOUT_MS = 90_000;
+
+/** Subagent nesting depth beyond which `delegate` refuses to spawn a child (MVP: no recursive spawn). */
+const SUBAGENT_MAX_DEPTH = 1;
+
+/**
+ * Runs `tasks` (in array order) with at most `limit` concurrently in flight.
+ * Results are returned in the same order as `tasks`, regardless of finish order.
+ */
+async function runWithConcurrencyLimit<T>(tasks: Array<() => Promise<T>>, limit: number): Promise<T[]> {
+  const results: T[] = new Array(tasks.length);
+  let next = 0;
+  async function worker(): Promise<void> {
+    while (true) {
+      const index = next;
+      next += 1;
+      if (index >= tasks.length) return;
+      results[index] = await tasks[index]();
+    }
+  }
+  const workers = Array.from({ length: Math.min(limit, tasks.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
 
 const TOOLS = [
-  { name: "read_file", description: "Read a file from the workspace or sandbox." },
-  { name: "write_file", description: "Write a file in the workspace or sandbox." },
-  { name: "bash", description: "Run a shell command." },
-  { name: "glob", description: "Search the workspace for files matching a glob pattern." },
-  { name: "grep", description: "Search file contents for a regex pattern, optionally scoped by path/glob." },
-  { name: "list_dir", description: "List the contents of a directory in the workspace." },
+  {
+    name: "read_file",
+    description:
+      "Read a file from the workspace or sandbox. Optional `offset` (1-based line number to start at) and `limit` (max lines to return) let you read a slice of a large file instead of the whole thing. Without offset/limit, results are capped at 2,000 lines / 20,000 characters; oversized results are cut with a '... truncated N bytes/lines ...' marker — pass offset/limit to page through the rest.",
+  },
+  { name: "write_file", description: "Write a file in the workspace or sandbox. Use only to create a new file or intentionally overwrite it entirely; prefer edit_file for changes to existing files." },
+  {
+    name: "edit_file",
+    description:
+      "Make a precise edit to an existing file by replacing an exact old_string with new_string. old_string must match exactly once in the file (include enough surrounding context to make it unique), unless replace_all is set. Prefer this over write_file for any change to an existing file — it avoids rewriting the whole file for a small change.",
+  },
+  {
+    name: "bash",
+    description:
+      "Run a shell command. stdout/stderr are capped at 500 lines (head+tail) and 20,000 characters each; oversized output is cut with a truncation marker.",
+  },
+  {
+    name: "glob",
+    description: "Search the workspace for files matching a glob pattern. Results are capped at 500 entries.",
+  },
+  {
+    name: "grep",
+    description:
+      "Search file contents for a regex pattern, optionally scoped by path/glob. Results are capped at 20,000 characters.",
+  },
+  {
+    name: "list_dir",
+    description: "List the contents of a directory in the workspace. Results are capped at 500 entries.",
+  },
+  {
+    name: "todo_write",
+    description:
+      'Replace the session\'s todo list with the given items, e.g. for a multi-step task. `items` is a JSON array of {"id","content","status"}, where status is "pending", "in_progress", or "completed". Pass the FULL desired list each call (not a delta) — omitted ids are dropped. Use for multi-step work so progress is visible; skip it for single-step tasks. Allowed in plan mode (planning is read-only) and build mode.',
+  },
+  {
+    name: "git_status",
+    description: "Show the git working tree status (branch + changed/staged/untracked files). Prefer this over running `git status` via bash. Read-only, allowed in plan mode.",
+  },
+  {
+    name: "git_diff",
+    description: "Show the git diff, optionally scoped to a `path`. Prefer this over running `git diff` via bash. Output is capped like bash output. Read-only, allowed in plan mode.",
+  },
+  {
+    name: "git_log",
+    description: "Show recent commit history (short hash, date, subject). Optional `max_count` (default 20, max 200). Prefer this over running `git log` via bash. Read-only, allowed in plan mode.",
+  },
+  {
+    name: "git_commit",
+    description:
+      "Stage changes and create a git commit. Requires an explicit `message` (non-empty). Stages all changes by default (`git add -A`); pass stage_all=\"false\" to commit only what's already staged. Never uses --no-verify, --amend, or force push. Prefer this over `git commit`/`git push` via bash. Denied in plan mode.",
+  },
+  {
+    name: "run_tests",
+    description:
+      'Run the project\'s test/lint/typecheck/build step and get a structured pass/fail verdict. Without arguments, runs the package.json "test" script. Pass `script` ("test", "lint", "typecheck", or "build") to run a different package.json script, or `command` to run an arbitrary shell command instead (overrides `script`). Returns exit code, pass/fail, a one-line summary, and capped combined stdout/stderr. Prefer this over ad hoc `bash` invocations of the test runner so the result is unambiguous. Denied in plan mode.',
+  },
+  {
+    name: "delegate",
+    description:
+      `Spawn an isolated subagent with its own message list (it does not see your conversation) to explore or build a bounded, self-contained subtask, then return a summary — not its full transcript. Args: \`task\` (required — a clear, self-contained instruction; the subagent has no other context, so include everything it needs), \`mode\` (optional, "plan" (default, read-only explore) or "build"; a subagent can never be more permissive than you are — if you are in plan mode, your subagent is forced to plan mode even if you pass mode="build"), \`model\` (optional — only "inherit" is supported today, and is also the default). The subagent is capped at ${SUBAGENT_MAX_STEPS} steps and a ${Math.round(SUBAGENT_TIMEOUT_MS / 1000)}s timeout, and cannot spawn further subagents (depth limit ${SUBAGENT_MAX_DEPTH}). Use it to offload a self-contained lookup or small patch rather than doing every step yourself; don't use it for work that needs your ongoing conversation context.`,
+  },
+  {
+    name: "skill",
+    description:
+      'Load an on-demand markdown skill file into context, or list what\'s available. Skills live in .harnes/skills/ (workspace) and ~/.config/harnes/skills/ (user-level); a workspace skill shadows a same-named user skill. Call with no `name` to list available skills; call with `name` set to load that skill\'s body (capped at 8,000 characters, truncated with a marker if longer). Read-only, allowed in plan mode.',
+  },
 ];
 
 function emptyUsage(): CompletionUsage {
@@ -72,8 +181,41 @@ export async function runAgentLoop(opts: {
   onProgress?: (event: LoopProgress) => void;
   /** Return false to deny a tool that needs interactive approval. */
   onApprove?: (call: ToolCall) => Promise<boolean>;
+  /**
+   * Session todo list. When provided, `todo_write` calls mutate this array
+   * in place so the caller (e.g. the REPL, for /todos) sees updates across
+   * turns. When omitted, a fresh in-memory list is used for this call only.
+   */
+  todos?: TodoItem[];
+  /**
+   * Internal: current subagent nesting depth. Callers (the REPL, `harnes run`)
+   * should never set this — it defaults to 0 for a top-level turn. `delegate`
+   * sets it to depth + 1 when spawning a child loop, and a child at
+   * `SUBAGENT_MAX_DEPTH` refuses to spawn its own subagents.
+   */
+  subagentDepth?: number;
+  /**
+   * Internal: overrides SUBAGENT_TIMEOUT_MS for any `delegate` call made at
+   * this loop level. Exists mainly so tests can exercise the hard timeout
+   * without waiting the real ~90s; the REPL / `harnes run` should never set it.
+   */
+  subagentTimeoutMs?: number;
+  /**
+   * Optional MCP tool provider. When set (and it reports servers configured),
+   * its tools are namespaced `mcp__<server>__<tool>` and appended to the
+   * model's tool list for this turn. Omitted entirely when no MCP servers
+   * are configured, so an empty config adds zero overhead ("disabled by
+   * default when config empty").
+   */
+  mcp?: McpToolProvider;
+  /** Workspace root used to resolve `.harnes/skills/`. Defaults to `process.cwd()`. */
+  cwd?: string;
+  /** preToolUse/postToolUse hook definitions from config (see src/hooks.ts). Omitted = no config-defined hooks. */
+  hooks?: HooksConfig;
 }): Promise<LoopResult> {
   const maxSteps = opts.maxSteps ?? 12;
+  const subagentDepth = opts.subagentDepth ?? 0;
+  const todos = opts.todos ?? [];
   const prior = (opts.history ?? []).filter((message) => message.role !== "system");
   const messages: ChatMessage[] = [
     {
@@ -84,65 +226,199 @@ export async function runAgentLoop(opts: {
     { role: "user", content: opts.prompt },
   ];
   const usage = emptyUsage();
+  // Fetched once per turn (not per step): the provider caches its per-server
+  // connections/tool lists, so repeat calls across turns are cheap.
+  const mcpTools = opts.mcp ? await opts.mcp.listTools() : [];
+  const tools = mcpTools.length > 0 ? [...TOOLS, ...mcpTools] : TOOLS;
 
   for (let step = 0; step < maxSteps; step += 1) {
     opts.onProgress?.({ type: "thinking", step: step + 1 });
     const reply = await opts.complete({
       model: opts.model.providerModel,
       messages,
-      tools: TOOLS,
+      tools,
     });
     addUsage(usage, reply.usage);
     messages.push({ role: "assistant", content: reply.content });
 
     if (reply.toolCalls.length === 0) {
-      return { messages, steps: step + 1, stoppedReason: "complete", usage };
+      return { messages, steps: step + 1, stoppedReason: "complete", usage, todos };
     }
 
+    // Resolve permission + interactive approval sequentially, in model call
+    // order, before any tool runs. Approval prompts are user-facing (REPL UI)
+    // and must not overlap, so this phase never runs concurrently even
+    // though execution below does. A denial fails only that call — it does
+    // not cancel sibling calls that have already been kicked off (see loop
+    // below), matching the "don't cancel siblings mid-flight" rule.
+    type Resolved = { call: ToolCall; denied?: string };
+    const resolved: Resolved[] = [];
     for (const call of reply.toolCalls) {
-      if (!isToolAllowed(opts.permissionMode, call.name)) {
-        messages.push({
-          role: "tool",
-          tool_call_id: call.id,
-          content: `Tool ${call.name} is not available in ${opts.permissionMode} mode.`,
-        });
-        return { messages, steps: step + 1, stoppedReason: "denied-tool", usage };
+      const allowed = call.name.startsWith(MCP_TOOL_PREFIX)
+        ? Boolean(opts.mcp) && mcpToolAllowed(opts.permissionMode, opts.mcp!.classify(call.name))
+        : isToolAllowed(opts.permissionMode, call.name);
+      if (!allowed) {
+        resolved.push({ call, denied: `Tool ${call.name} is not available in ${opts.permissionMode} mode.` });
+        continue;
       }
       if (opts.onApprove && !(await opts.onApprove(call))) {
-        messages.push({
-          role: "tool",
-          tool_call_id: call.id,
-          content: `User denied tool ${call.name}.`,
-        });
-        return { messages, steps: step + 1, stoppedReason: "denied-tool", usage };
+        resolved.push({ call, denied: `User denied tool ${call.name}.` });
+        continue;
       }
-      opts.onProgress?.({ type: "tool", step: step + 1, name: call.name });
-      const result = await executeTool(opts.backend, call);
-      messages.push({ role: "tool", tool_call_id: call.id, content: result });
+      resolved.push({ call });
+    }
+
+    const runnable = resolved.filter((entry) => !entry.denied);
+    const forceSerial = runnable.some((entry) => SERIAL_ONLY_TOOLS.has(entry.call.name));
+    const concurrency = forceSerial ? 1 : TOOL_CONCURRENCY_LIMIT;
+    const results = await runWithConcurrencyLimit(
+      runnable.map((entry) => async () => {
+        opts.onProgress?.({ type: "tool", step: step + 1, name: entry.call.name });
+        return await executeTool(
+          opts.backend,
+          entry.call,
+          todos,
+          {
+            complete: opts.complete,
+            model: opts.model,
+            permissionMode: opts.permissionMode,
+            depth: subagentDepth,
+            onProgress: opts.onProgress,
+            timeoutMs: opts.subagentTimeoutMs,
+            cwd: opts.cwd ?? process.cwd(),
+            hooks: opts.hooks,
+          },
+          opts.mcp
+        );
+      }),
+      concurrency
+    );
+
+    // Rebuild the transcript in original model call order (not completion order).
+    let runnableIndex = 0;
+    let anyDenied = false;
+    for (const entry of resolved) {
+      if (entry.denied) {
+        anyDenied = true;
+        messages.push({ role: "tool", tool_call_id: entry.call.id, content: entry.denied });
+      } else {
+        messages.push({ role: "tool", tool_call_id: entry.call.id, content: results[runnableIndex] });
+        runnableIndex += 1;
+      }
+    }
+
+    if (anyDenied) {
+      return { messages, steps: step + 1, stoppedReason: "denied-tool", usage, todos };
     }
   }
 
-  return { messages, steps: maxSteps, stoppedReason: "max-steps", usage };
+  return { messages, steps: maxSteps, stoppedReason: "max-steps", usage, todos };
 }
 
 function systemPrompt(mode: PermissionMode, exec: string): string {
   return [
+    // Identity + session state.
     "You are Harnes, the open coding agent.",
     `Permission mode: ${mode}. Execution: ${exec}.`,
-    "Use tools. Prefer small diffs. Recover from failed tool calls instead of stopping.",
+    "Use tools rather than guessing, keep changes small, and recover from a failed tool call instead of stopping the turn.",
+
+    // Editing: patch-first, whole-file write as the exception.
+    "Editing files: prefer edit_file (exact old_string -> new_string replacement) for any change to an existing file — it's precise and cheap to review. Reserve write_file for creating a new file or an intentional full-file rewrite.",
+
+    // Reading: ranged reads + caps, so context isn't wasted.
+    "Reading files: read_file supports offset/limit to page through large files; all tool output (read_file, bash, grep, glob, list_dir) is capped and marked with '... truncated ...' when cut, so re-run with a narrower range or pattern instead of assuming truncated output is complete.",
+
+    // Multi-step tracking.
+    "Multi-step work: track progress with todo_write — create the list up front, mark an item in_progress before starting it and completed right after it's done. Skip it for trivial single-step requests; don't spam updates.",
+
+    // Git: structured tools over raw bash.
+    "Git: prefer git_status/git_diff/git_log/git_commit over raw `git ...` via bash — they're capped and permission-gated correctly. git_commit always requires an explicit message and never force-pushes, amends, or skips hooks.",
+
+    // Verification before declaring done.
+    "Verification: before declaring work done, run run_tests (defaults to the package.json \"test\" script; pass script=\"lint\"/\"typecheck\"/\"build\", or an explicit command override, for other checks) instead of guessing pass/fail from bash output.",
+
+    // Subagents: offload bounded, self-contained work.
+    "Subagents: delegate spawns an isolated subagent for a bounded, self-contained lookup or small patch — it gets only the `task` text you give it, not your conversation. It's capped in steps/time, can't be more permissive than your own mode, and can't spawn further subagents. Prefer doing multi-step work yourself when it needs your ongoing context; delegate for work you can fully describe in one instruction.",
+
+    // MCP: external tools, namespaced and gated like everything else.
+    "MCP tools: any tool named mcp__<server>__<tool> comes from an external MCP server configured in ~/.config/harnes/config.json — use it like a built-in tool. Ones the server or your permission mode can't confirm are read-only may need explicit approval or be unavailable in plan mode.",
+
+    // Skills: on-demand instruction files.
+    "Skills: call skill with no arguments to see what's available in .harnes/skills/ and ~/.config/harnes/skills/, or with name set to load one's instructions into context. Use it when a task matches a named skill instead of guessing project conventions.",
+
+    // Tone / honesty.
     "Do not claim frontier-model quality on weak open weights.",
     "When reporting paths to the user, prefer short paths (relative or ~/…) over absolute home paths.",
   ].join(" ");
 }
 
-async function executeTool(backend: ExecutionBackend, call: ToolCall): Promise<string> {
+/** Context an in-flight loop passes down to `executeTool` so `delegate` can spawn a child loop. */
+interface SubagentContext {
+  complete: CompletionClient["complete"];
+  model: ModelSpec;
+  permissionMode: PermissionMode;
+  depth: number;
+  onProgress?: (event: LoopProgress) => void;
+  /** Overrides SUBAGENT_TIMEOUT_MS for this call's own `delegate` spawns (tests only). */
+  timeoutMs?: number;
+  /** Workspace root used to resolve `.harnes/skills/` for the `skill` tool. */
+  cwd: string;
+  /** preToolUse/postToolUse hook definitions from config, threaded down to a `delegate` child loop too. */
+  hooks?: HooksConfig;
+}
+
+async function executeTool(
+  backend: ExecutionBackend,
+  call: ToolCall,
+  todos: TodoItem[],
+  subagent: SubagentContext,
+  mcp?: McpToolProvider
+): Promise<string> {
+  await runHooks(
+    "preToolUse",
+    { event: "preToolUse", tool: call.name, arguments: call.arguments },
+    subagent.hooks?.preToolUse
+  );
+  const result = await dispatchTool(backend, call, todos, subagent, mcp);
+  await runHooks(
+    "postToolUse",
+    { event: "postToolUse", tool: call.name, arguments: call.arguments, result },
+    subagent.hooks?.postToolUse
+  );
+  return result;
+}
+
+async function dispatchTool(
+  backend: ExecutionBackend,
+  call: ToolCall,
+  todos: TodoItem[],
+  subagent: SubagentContext,
+  mcp?: McpToolProvider
+): Promise<string> {
   try {
+    if (call.name.startsWith(MCP_TOOL_PREFIX)) {
+      if (!mcp) return "Tool error: no MCP servers are configured.";
+      return await mcp.callTool(call.name, call.arguments);
+    }
     if (call.name === "read_file") {
-      return await backend.readFile(call.arguments.path ?? "");
+      const offset = parsePositiveInt(call.arguments.offset);
+      const limit = parsePositiveInt(call.arguments.limit);
+      const hasOptions = offset !== undefined || limit !== undefined;
+      return await backend.readFile(call.arguments.path ?? "", hasOptions ? { offset, limit } : undefined);
     }
     if (call.name === "write_file") {
       await backend.writeFile(call.arguments.path ?? "", call.arguments.contents ?? "");
       return `Wrote ${call.arguments.path}`;
+    }
+    if (call.name === "edit_file") {
+      const replaceAll = call.arguments.replace_all === "true" || call.arguments.replace_all === "1";
+      const result = await backend.editFile(
+        call.arguments.path ?? "",
+        call.arguments.old_string ?? "",
+        call.arguments.new_string ?? "",
+        replaceAll
+      );
+      return `Edited ${call.arguments.path} (${result.replacements} replacement${result.replacements === 1 ? "" : "s"})`;
     }
     if (call.name === "bash") {
       const result = await backend.run(call.arguments.command ?? "");
@@ -159,10 +435,139 @@ async function executeTool(backend: ExecutionBackend, call: ToolCall): Promise<s
       const entries = await backend.listDir(call.arguments.path);
       return entries.length > 0 ? entries.join("\n") : "(empty directory)";
     }
+    if (call.name === "todo_write") {
+      const items = parseTodoItems(call.arguments.items);
+      setTodos(todos, items);
+      return `Todos updated:\n${formatTodoList(todos)}`;
+    }
+    if (call.name === "git_status") {
+      return await backend.gitStatus();
+    }
+    if (call.name === "git_diff") {
+      return await backend.gitDiff(call.arguments.path);
+    }
+    if (call.name === "git_log") {
+      const maxCount = parsePositiveInt(call.arguments.max_count);
+      return await backend.gitLog(maxCount);
+    }
+    if (call.name === "git_commit") {
+      const stageAll = call.arguments.stage_all !== "false" && call.arguments.stage_all !== "0";
+      const result = await backend.gitCommit(call.arguments.message ?? "", { stageAll });
+      return `Committed ${result.commit}${result.summary ? `\n${result.summary}` : ""}`;
+    }
+    if (call.name === "run_tests") {
+      const command = call.arguments.command && call.arguments.command.trim() !== "" ? call.arguments.command : undefined;
+      const script = call.arguments.script && call.arguments.script.trim() !== "" ? call.arguments.script : undefined;
+      const result = await backend.runCheck({ command, script });
+      return `${result.summary}\n${result.output}`;
+    }
+    if (call.name === "delegate") {
+      return await runDelegate(backend, call, subagent);
+    }
+    if (call.name === "skill") {
+      const name = (call.arguments.name ?? "").trim();
+      if (!name) {
+        const skills = await listSkills(subagent.cwd);
+        return `Skills:\n${formatSkillList(skills)}`;
+      }
+      return await loadSkill(name, subagent.cwd);
+    }
     return `Unknown tool ${call.name}`;
   } catch (error) {
     return `Tool error: ${error instanceof Error ? error.message : String(error)}`;
   }
+}
+
+/**
+ * Runs a `delegate` tool call: spawns an isolated child `runAgentLoop` with its
+ * own message list (only `task` as the prompt, no parent history), capped
+ * steps/timeout, and depth-limited to MVP's "no recursive spawn" rule. Returns
+ * a short summary (final assistant message + files touched) instead of the
+ * child's full transcript.
+ */
+async function runDelegate(backend: ExecutionBackend, call: ToolCall, subagent: SubagentContext): Promise<string> {
+  const task = (call.arguments.task ?? "").trim();
+  if (!task) {
+    return "Tool error: delegate requires a non-empty `task` describing the subagent's work.";
+  }
+  if (subagent.depth >= SUBAGENT_MAX_DEPTH) {
+    return `Tool error: subagents cannot spawn further subagents (depth limit ${SUBAGENT_MAX_DEPTH}).`;
+  }
+
+  const requestedMode: PermissionMode = call.arguments.mode === "build" ? "build" : "plan";
+  // Mode inheritance: a subagent can never be more permissive than its parent.
+  // A plan-mode parent is forced to spawn a plan-mode child even if it asks for "build".
+  const childPermissionMode: PermissionMode = subagent.permissionMode === "plan" ? "plan" : requestedMode;
+  const modelNote =
+    call.arguments.model && call.arguments.model !== "inherit"
+      ? " (model override not supported yet; used the parent's model)"
+      : "";
+
+  subagent.onProgress?.({ type: "subagent", step: 0, task: task.length > 80 ? `${task.slice(0, 77)}...` : task });
+
+  // Track files the child mutates so the parent gets a touch list instead of the raw transcript.
+  const touched: string[] = [];
+  const trackingBackend: ExecutionBackend = {
+    mode: backend.mode,
+    run: (command, cwd) => backend.run(command, cwd),
+    readFile: (path, options) => backend.readFile(path, options),
+    writeFile: async (path, contents) => {
+      touched.push(path);
+      return backend.writeFile(path, contents);
+    },
+    editFile: async (path, oldString, newString, replaceAll) => {
+      touched.push(path);
+      return backend.editFile(path, oldString, newString, replaceAll);
+    },
+    glob: (pattern) => backend.glob(pattern),
+    grep: (pattern, path, glob) => backend.grep(pattern, path, glob),
+    listDir: (path) => backend.listDir(path),
+    gitStatus: () => backend.gitStatus(),
+    gitDiff: (path) => backend.gitDiff(path),
+    gitLog: (maxCount) => backend.gitLog(maxCount),
+    gitCommit: async (message, options) => {
+      const result = await backend.gitCommit(message, options);
+      touched.push(`(git commit ${result.commit})`);
+      return result;
+    },
+    runCheck: (options) => backend.runCheck(options),
+    close: () => backend.close(),
+  };
+
+  const childLoop = runAgentLoop({
+    prompt: task,
+    model: subagent.model,
+    backend: trackingBackend,
+    complete: subagent.complete,
+    permissionMode: childPermissionMode,
+    maxSteps: SUBAGENT_MAX_STEPS,
+    subagentDepth: subagent.depth + 1,
+    cwd: subagent.cwd,
+    hooks: subagent.hooks,
+  });
+
+  const timeoutMs = subagent.timeoutMs ?? SUBAGENT_TIMEOUT_MS;
+  const timedOut = Symbol("subagent-timeout");
+  const outcome = await Promise.race([
+    childLoop,
+    new Promise<typeof timedOut>((resolve) => setTimeout(() => resolve(timedOut), timeoutMs)),
+  ]);
+
+  if (outcome === timedOut) {
+    return `Subagent timed out after ${Math.round(timeoutMs / 1000)}s in ${childPermissionMode} mode${modelNote}. Any partial work it did is not reflected here — check git_status/git_diff if it may have written files.`;
+  }
+
+  const result = outcome;
+  const lastAssistant = [...result.messages].reverse().find((message) => message.role === "assistant" && message.content);
+  const summary = lastAssistant?.content?.trim() || "(subagent produced no final message)";
+  const fileList = touched.length > 0 ? touched.map((file) => `- ${file}`).join("\n") : "(no files touched)";
+  return [
+    `Subagent done (${childPermissionMode} mode, ${result.steps} step${result.steps === 1 ? "" : "s"}, ${result.stoppedReason}${modelNote}):`,
+    summary,
+    "",
+    "Files touched:",
+    fileList,
+  ].join("\n");
 }
 
 export async function openaiCompatibleComplete(
@@ -214,6 +619,13 @@ export async function openaiCompatibleComplete(
     toolCalls,
     usage: parseCompletionUsage(json.usage),
   };
+}
+
+/** Parses a tool argument string into a positive integer, or undefined if absent/invalid. */
+function parsePositiveInt(raw: string | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
 function safeJson(raw: string): Record<string, string> {

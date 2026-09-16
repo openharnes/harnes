@@ -1,5 +1,6 @@
 import type { PermissionMode, SessionMode } from "./exec/types.ts";
 import { normalizeSessionMode } from "./exec/types.ts";
+import type { HooksConfig } from "./hooks.ts";
 import {
   OLLAMA_BASE_URL,
   OPENROUTER_BASE_URL,
@@ -32,6 +33,20 @@ export interface HarnesConfig {
    * Default is notify-only; use `/update auto on` to enable.
    */
   autoUpdate?: boolean;
+  /**
+   * External MCP (Model Context Protocol) servers to connect to over stdio,
+   * keyed by a short name used for tool namespacing (mcp__<name>__<tool>).
+   * Absent or empty = MCP is disabled; nothing is spawned. Example:
+   * { "mcpServers": { "fs": { "command": "npx", "args": ["-y", "some-mcp-server"] } } }
+   */
+  mcpServers?: Record<string, { command: string; args?: string[]; env?: Record<string, string> }>;
+  /**
+   * Thin preToolUse/postToolUse hook points. Each entry is a shell command
+   * (matched by tool name, or every tool when `match` is omitted/"*") run
+   * with the event payload as JSON on stdin. Best-effort: a failing or slow
+   * hook is logged and never blocks a tool call. See docs/skills.md.
+   */
+  hooks?: HooksConfig;
 }
 
 export const DEFAULT_CONFIG: HarnesConfig = {

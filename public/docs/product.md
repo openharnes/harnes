@@ -25,10 +25,10 @@ Teams that want an autonomous coding agent with open models (OpenRouter / local)
 
 ## What you get
 
-- Persistent REPL (`harnes`) with `/model`, `/mode`, `/usage`, `/update`, live OpenRouter catalog + spend
+- Persistent REPL (`harnes`) with `/model`, `/mode`, `/usage`, `/update`, `/todos`, live OpenRouter catalog + spend
 - Shift+Tab cycles approval modes: automatic → manual → ask on edit → plan
-- Agent loop with tools: read / write / bash / glob / grep / list_dir
-- Permissions: plan = read-only explore; build = write + bash
+- Agent loop with tools: `read_file` (ranged reads), `write_file`, `edit_file` (patch-style edits), `bash`, `glob`, `grep`, `list_dir`, `todo_write`, `git_status` / `git_diff` / `git_log` / `git_commit`, `run_tests`, `delegate` (isolated, capped subagent for bounded subtasks) — all with capped output, and independent tool calls in a turn run in parallel
+- Permissions: plan = read-only explore + todos + git read tools; build = + write/edit/bash/commit/run_tests
 - Hybrid routing: fast-open / strong-open / frontier-byok
 - **Three model paths:** OpenRouter (all models), OpenHost (host your own), or local Ollama
 - MIT licensed — no seat fee
