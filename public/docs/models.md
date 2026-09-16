@@ -80,6 +80,7 @@ harnes smoke
 | `/model auto` | hybrid route per prompt |
 | `/model <id>` | pin a catalog / OpenRouter slug |
 | `/mode auto\|plan\|build` | tools + routing mode |
+| `/usage` (`/cost`) | session spend + OpenRouter today / week / month |
 
 ## Tools (agent)
 

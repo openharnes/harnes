@@ -8,9 +8,10 @@ import {
   type HarnesConfig,
 } from "./config.ts";
 import { LocalBackend } from "./exec/local.ts";
-import { openaiCompatibleComplete, runAgentLoop, type ChatMessage } from "./loop.ts";
+import { openaiCompatibleComplete, runAgentLoop, type ChatMessage, type LoopProgress } from "./loop.ts";
 import { getModel, listOpenRouterModels, MODEL_CATALOG, OPENROUTER_BASE_URL, OLLAMA_BASE_URL, normalizeModelId } from "./models/catalog.ts";
 import { ONE_LINER, PRODUCT_NAME, SHORT_NAME } from "./positioning.ts";
+import { fetchOpenRouterKeyUsage, formatUsd } from "./openrouter/usage.ts";
 import {
   formatFooterLines,
   formatTokenBar,
@@ -22,7 +23,46 @@ import type { SessionMode } from "./exec/types.ts";
 
 export type { SessionUsage };
 
-const VERSION = "0.1.7";
+function emptySessionUsage(): SessionUsage {
+  return {
+    turns: 0,
+    agentSteps: 0,
+    toolCalls: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    costUsd: 0,
+  };
+}
+
+/** Animated status line that rewrites in place so long turns don't look stuck. */
+function startStatusLine(initial = "Running"): { update: (text: string) => void; stop: (final?: string) => void } {
+  const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+  let i = 0;
+  let label = initial;
+  let stopped = false;
+  const tick = () => {
+    if (stopped) return;
+    const frame = frames[i % frames.length];
+    i += 1;
+    output.write(`\r${paint(ansi.warm, `${frame} ${label}…`)}${" ".repeat(12)}`);
+  };
+  tick();
+  const id = setInterval(tick, 80);
+  return {
+    update(text: string) {
+      label = text;
+    },
+    stop(final?: string) {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(id);
+      output.write(`\r\x1b[2K`);
+      if (final) console.log(paint(ansi.soft, final));
+    },
+  };
+}
+
+const VERSION = "0.1.9";
 const FOOTER_ROWS = 3; // separator + 2 status lines
 
 const SLASH_COMMANDS: Array<{ cmd: string; help: string }> = [
@@ -33,7 +73,8 @@ const SLASH_COMMANDS: Array<{ cmd: string; help: string }> = [
   { cmd: "/model auto", help: "route per prompt" },
   { cmd: "/models", help: "list catalog" },
   { cmd: "/mode", help: "auto | plan | build" },
-  { cmd: "/usage", help: "session usage" },
+  { cmd: "/usage", help: "session + OpenRouter spend" },
+  { cmd: "/cost", help: "alias for /usage" },
   { cmd: "/clear", help: "reset conversation memory" },
   { cmd: "/exit", help: "quit" },
 ];
@@ -83,7 +124,7 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
   const cwd = process.cwd();
   const backend = new LocalBackend(cwd);
   const history: ChatMessage[] = [];
-  const usage: SessionUsage = { turns: 0, agentSteps: 0, toolCalls: 0 };
+  const usage: SessionUsage = emptySessionUsage();
 
   if (!process.stdin.isTTY) {
     console.error("Persistent session needs a TTY. Use `harnes run \"...\"` for one-shot.");
@@ -124,7 +165,7 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
   const showIdle = () => {
     const session = resolveSession(config, history);
     const width = Math.min(process.stdout.columns || 80, 88);
-    const [line1, line2] = formatFooterLines(session);
+    const [line1, line2] = formatFooterLines(session, usage.costUsd);
     const plainPrompt = " › ";
     rl.setPrompt(promptPrefix());
     output.write(ansi.reset);
@@ -349,10 +390,8 @@ async function handleSlash(
       return "ok";
     case "clear":
       ctx.history.length = 0;
-      ctx.usage.turns = 0;
-      ctx.usage.agentSteps = 0;
-      ctx.usage.toolCalls = 0;
-      console.log(paint(ansi.muted, "Session cleared (context reset)."));
+      Object.assign(ctx.usage, emptySessionUsage());
+      console.log(paint(ansi.muted, "Session cleared (context + session cost reset)."));
       return "ok";
     case "models":
       await listModels(ctx.getConfig());
@@ -361,7 +400,8 @@ async function handleSlash(
       await setModel(ctx, arg);
       return "ok";
     case "usage":
-      printUsage(ctx.usage, ctx.getConfig(), ctx.history);
+    case "cost":
+      await printUsage(ctx.usage, ctx.getConfig(), ctx.history);
       return "ok";
     case "status": {
       printFullStatus(ctx.getConfig(), ctx.history, ctx.cwd, ctx.usage);
@@ -475,38 +515,87 @@ async function runTurn(
     return;
   }
 
-  console.log(paint(ansi.warm, "Running…"));
-
+  const started = Date.now();
+  const status = startStatusLine("Running");
   const session = resolveSession(config, history, prompt);
   const endpoint = resolveChatEndpoint(config);
 
-  const result = await runAgentLoop({
-    prompt,
-    model: { ...session.model, providerModel: session.wireId },
-    backend,
-    permissionMode: session.permissionMode,
-    history,
-    complete: (input) => openaiCompatibleComplete(endpoint.baseUrl, endpoint.apiKey, input),
-  });
+  try {
+    const result = await runAgentLoop({
+      prompt,
+      model: { ...session.model, providerModel: session.wireId },
+      backend,
+      permissionMode: session.permissionMode,
+      history,
+      complete: (input) => openaiCompatibleComplete(endpoint.baseUrl, endpoint.apiKey, input),
+      onProgress: (event: LoopProgress) => {
+        if (event.type === "thinking") status.update(`Thinking · step ${event.step}`);
+        else status.update(`${event.name} · step ${event.step}`);
+      },
+    });
 
-  usage.turns += 1;
-  usage.agentSteps += result.steps;
-  usage.toolCalls += result.messages.filter((message) => message.role === "tool").length;
+    usage.turns += 1;
+    usage.agentSteps += result.steps;
+    usage.toolCalls += result.messages.filter((message) => message.role === "tool").length;
+    usage.promptTokens += result.usage.promptTokens;
+    usage.completionTokens += result.usage.completionTokens;
+    usage.costUsd += result.usage.costUsd ?? 0;
 
-  history.length = 0;
-  history.push(...result.messages.filter((message) => message.role !== "system"));
+    history.length = 0;
+    history.push(...result.messages.filter((message) => message.role !== "system"));
 
-  const last = [...result.messages].reverse().find((message) => message.role === "assistant" && message.content);
-  console.log("");
-  if (last?.content) console.log(last.content);
-  else console.log(paint(ansi.muted, `(${result.stoppedReason} after ${result.steps} steps)`));
+    const elapsedSec = ((Date.now() - started) / 1000).toFixed(1);
+    const turnCost = result.usage.costUsd ?? 0;
+    const costPart =
+      endpoint.provider === "openrouter" || turnCost > 0
+        ? ` · ${formatUsd(turnCost)} this turn · ${formatUsd(usage.costUsd)} session`
+        : "";
+    status.stop(
+      `✓ Done · ${elapsedSec}s · ${result.steps} step${result.steps === 1 ? "" : "s"} · ${result.stoppedReason}${costPart}`
+    );
+
+    const last = [...result.messages].reverse().find((message) => message.role === "assistant" && message.content);
+    console.log("");
+    if (last?.content) console.log(last.content);
+    else console.log(paint(ansi.muted, `(${result.stoppedReason} after ${result.steps} steps)`));
+  } catch (error) {
+    status.stop();
+    throw error;
+  }
 }
 
-function printUsage(usage: SessionUsage, config: HarnesConfig, history: ChatMessage[]): void {
+async function printUsage(usage: SessionUsage, config: HarnesConfig, history: ChatMessage[]): Promise<void> {
   const session = resolveSession(config, history);
+  const endpoint = resolveChatEndpoint(config);
+  console.log(paint(ansi.accentBright, "This session"));
   console.log(
-    `session  turns=${usage.turns}  steps=${usage.agentSteps}  tool_calls=${usage.toolCalls}  ctx ${formatTokenBar(session.tokensUsed, session.contextWindow)}`
+    `  turns ${usage.turns}  ·  steps ${usage.agentSteps}  ·  tools ${usage.toolCalls}  ·  ctx ${formatTokenBar(session.tokensUsed, session.contextWindow)}`
   );
+  console.log(
+    `  tokens in ${usage.promptTokens.toLocaleString()} / out ${usage.completionTokens.toLocaleString()}  ·  spend ${formatUsd(usage.costUsd)}`
+  );
+
+  if (endpoint.provider === "openrouter" && endpoint.apiKey) {
+    console.log("");
+    console.log(paint(ansi.accentBright, "OpenRouter (this API key)"));
+    try {
+      const key = await fetchOpenRouterKeyUsage(endpoint.apiKey);
+      console.log(`  today     ${formatUsd(key.usageDaily)}`);
+      console.log(`  week      ${formatUsd(key.usageWeekly)}`);
+      console.log(`  month     ${formatUsd(key.usageMonthly)}  (≈ last 30 days on this key)`);
+      console.log(`  lifetime  ${formatUsd(key.usage)}`);
+      if (key.limit != null) {
+        console.log(
+          `  limit     ${formatUsd(key.limitRemaining ?? 0)} left of ${formatUsd(key.limit)}${key.limitReset ? ` · resets ${key.limitReset}` : ""}`
+        );
+      }
+    } catch (error) {
+      console.log(paint(ansi.muted, `  (could not fetch /key: ${error instanceof Error ? error.message : error})`));
+    }
+  } else {
+    console.log("");
+    console.log(paint(ansi.muted, "OpenRouter spend breakdown needs provider=openrouter."));
+  }
 }
 
 function printFullStatus(config: HarnesConfig, history: ChatMessage[], cwd: string, usage: SessionUsage): void {
@@ -520,7 +609,7 @@ function printFullStatus(config: HarnesConfig, history: ChatMessage[], cwd: stri
   console.log(`context    ${formatTokenBar(session.tokensUsed, session.contextWindow)}`);
   console.log(`cwd        ${shortCwd(cwd)}`);
   console.log(`history    ${history.length} messages`);
-  console.log(`usage      turns=${usage.turns} tools=${usage.toolCalls}`);
+  console.log(`usage      turns=${usage.turns} tools=${usage.toolCalls} spend=${formatUsd(usage.costUsd)}`);
 }
 
 function maskKey(key: string | undefined): string {

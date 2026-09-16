@@ -1,6 +1,6 @@
 {
   "name": "@openharnes/harnes",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Harnes is the open coding agent.",
   "type": "module",
   "bin": {
@@ -21,7 +21,7 @@
     "dev": "tsx src/cli.ts",
     "harnes": "tsx src/cli.ts",
     "prepare": "npm run build",
-    "test": "tsx --test src/positioning.test.ts src/config.test.ts src/loop.test.ts src/models/catalog.test.ts src/session.test.ts",
+    "test": "tsx --test src/positioning.test.ts src/config.test.ts src/loop.test.ts src/models/catalog.test.ts src/session.test.ts src/openrouter/usage.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "engines": {
