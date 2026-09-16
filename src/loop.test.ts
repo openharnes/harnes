@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { runAgentLoop, type CompletionClient } from "./loop.ts";
+import { runAgentLoop, shouldAutoContinue, type CompletionClient } from "./loop.ts";
 import type { McpToolProvider } from "./mcp/manager.ts";
 import type { ExecutionBackend } from "./exec/types.ts";
 import { LocalBackend } from "./exec/local.ts";
@@ -13,6 +13,56 @@ import { DEFAULT_CONFIG } from "./config.ts";
 import { isToolAllowed, needsApproval } from "./exec/types.ts";
 
 const model = getModel("qwen3-coder-30b");
+
+describe("shouldAutoContinue", () => {
+  it("nudges when the model only announces the next action", () => {
+    assert.equal(shouldAutoContinue("Let me try to read the index.html file."), true);
+    assert.equal(shouldAutoContinue("First, let me check if we have a web server available."), true);
+    assert.equal(shouldAutoContinue("I'll check if Python is available."), true);
+  });
+
+  it("nudges when the model asks for an ok / confirmation", () => {
+    assert.equal(shouldAutoContinue("Want me to start the server?"), true);
+    assert.equal(shouldAutoContinue("Say ok to continue."), true);
+  });
+
+  it("does not nudge finished answers", () => {
+    assert.equal(shouldAutoContinue("Server is running at http://127.0.0.1:8000 — let me know if you need anything else."), false);
+    assert.equal(shouldAutoContinue("Here's what I found in the folder."), false);
+    assert.equal(shouldAutoContinue(""), false);
+  });
+});
+
+describe("agent loop auto-continue", () => {
+  it("nudges a stalled narration into a follow-up tool call instead of ending the turn", async () => {
+    const backend = memoryBackend();
+    backend.files.set("index.html", "<h1>hi</h1>");
+    let calls = 0;
+    const result = await runAgentLoop({
+      prompt: "spin up index.html",
+      model,
+      backend,
+      permissionMode: "build",
+      complete: async () => {
+        calls += 1;
+        if (calls === 1) {
+          return { content: "Let me try to read the index.html file.", toolCalls: [] };
+        }
+        if (calls === 2) {
+          return {
+            content: "",
+            toolCalls: [{ id: "1", name: "read_file", arguments: { path: "index.html" } }],
+          };
+        }
+        return { content: "Found index.html.", toolCalls: [] };
+      },
+    });
+    assert.ok(calls >= 2);
+    assert.equal(result.stoppedReason, "complete");
+    assert.ok(result.messages.some((m) => m.role === "tool" && m.content.includes("<h1>hi</h1>")));
+    assert.ok(result.messages.some((m) => m.role === "user" && /Continue the task now/i.test(m.content)));
+  });
+});
 
 function memoryBackend(): ExecutionBackend & { files: Map<string, string>; commands: string[] } {
   const files = new Map<string, string>();

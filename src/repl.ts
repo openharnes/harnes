@@ -87,7 +87,7 @@ function startStatusLine(initial = "Running"): { update: (text: string) => void;
   };
 }
 
-const VERSION = "0.3.0";
+const VERSION = "0.3.1";
 const FOOTER_ROWS = 3; // full-width rule + status + bottom bar
 
 const SLASH_COMMANDS: Array<{ cmd: string; help: string }> = [

@@ -213,7 +213,7 @@ export async function runAgentLoop(opts: {
   /** preToolUse/postToolUse hook definitions from config (see src/hooks.ts). Omitted = no config-defined hooks. */
   hooks?: HooksConfig;
 }): Promise<LoopResult> {
-  const maxSteps = opts.maxSteps ?? 12;
+  const maxSteps = opts.maxSteps ?? 24;
   const subagentDepth = opts.subagentDepth ?? 0;
   const todos = opts.todos ?? [];
   const prior = (opts.history ?? []).filter((message) => message.role !== "system");
@@ -230,6 +230,7 @@ export async function runAgentLoop(opts: {
   // connections/tool lists, so repeat calls across turns are cheap.
   const mcpTools = opts.mcp ? await opts.mcp.listTools() : [];
   const tools = mcpTools.length > 0 ? [...TOOLS, ...mcpTools] : TOOLS;
+  let autoContinues = 0;
 
   for (let step = 0; step < maxSteps; step += 1) {
     opts.onProgress?.({ type: "thinking", step: step + 1 });
@@ -242,6 +243,15 @@ export async function runAgentLoop(opts: {
     messages.push({ role: "assistant", content: reply.content });
 
     if (reply.toolCalls.length === 0) {
+      // Weak models often narrate "Let me check…" / ask for "ok" and stop with
+      // zero tool calls. Nudge them to keep acting instead of making the user
+      // type "ok" after every micro-step.
+      if (autoContinues < MAX_AUTO_CONTINUES && shouldAutoContinue(reply.content)) {
+        autoContinues += 1;
+        opts.onProgress?.({ type: "thinking", step: step + 1 });
+        messages.push({ role: "user", content: CONTINUE_NUDGE });
+        continue;
+      }
       return { messages, steps: step + 1, stoppedReason: "complete", usage, todos };
     }
 
@@ -322,6 +332,9 @@ function systemPrompt(mode: PermissionMode, exec: string): string {
     `Permission mode: ${mode}. Execution: ${exec}.`,
     "Use tools rather than guessing, keep changes small, and recover from a failed tool call instead of stopping the turn.",
 
+    // Autonomy — stop the "ok?" micro-step loop.
+    "Autonomy: the user should not have to type \"ok\" for you to continue. Keep calling tools in the same turn until the request is fully handled or you are blocked on a real decision only they can make (missing secret, destructive choice, ambiguous product requirement). Never stop after only announcing what you will do next — if you say \"let me check/read/run…\", that tool call must be in the same response. Do not ask \"Shall I proceed?\" / \"Want me to…?\" / \"Say ok to continue\" for routine explore/edit/run work.",
+
     // Editing: patch-first, whole-file write as the exception.
     "Editing files: prefer edit_file (exact old_string -> new_string replacement) for any change to an existing file — it's precise and cheap to review. Reserve write_file for creating a new file or an intentional full-file rewrite.",
 
@@ -350,6 +363,44 @@ function systemPrompt(mode: PermissionMode, exec: string): string {
     "Do not claim frontier-model quality on weak open weights.",
     "When reporting paths to the user, prefer short paths (relative or ~/…) over absolute home paths.",
   ].join(" ");
+}
+
+/** Max times we inject a continue nudge when the model stalls with no tool calls. */
+const MAX_AUTO_CONTINUES = 3;
+
+const CONTINUE_NUDGE =
+  'Continue the task now. Call the needed tools in this response — do not ask me to confirm or wait for another "ok". Only stop when the request is fully handled or you need a real decision only I can make.';
+
+/**
+ * Detects "Let me check…" / "Should I…?" stalls where the model narrates
+ * intent (or asks for confirmation) instead of emitting tool calls.
+ */
+export function shouldAutoContinue(content: string): boolean {
+  const text = content.trim();
+  if (!text) return false;
+  // Closing / finished answers — leave the turn alone.
+  if (
+    /\b(let me know if|if you need (anything|more)|hope (that|this) helps|you('re| are) all set|already running|server is (up|running)|created successfully|here('s| is) (the|what)|fixed\.|done\.|complete\.)\b/i.test(
+      text
+    )
+  ) {
+    return false;
+  }
+  if (
+    /\b(should i|shall i|want me to|may i|can i (proceed|continue)|say (ok|okay|yes) (to|when)|waiting for (your|you)|tell me (if|when) to|ok to (continue|proceed)\??)\b/i.test(
+      text
+    )
+  ) {
+    return true;
+  }
+  if (
+    /\b(let me (try|check|see|read|look|run|start|create|open|find|inspect|list|verify|spin)|i('ll| will) (now )?(check|read|try|look|run|start|create|open|find|inspect)|first[, ]+(let me|i('ll| will)|i need to)|next[, ]+(i('ll| will)|let me))\b/i.test(
+      text
+    )
+  ) {
+    return true;
+  }
+  return false;
 }
 
 /** Context an in-flight loop passes down to `executeTool` so `delegate` can spawn a child loop. */
