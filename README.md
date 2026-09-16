@@ -6,7 +6,8 @@
 
 ```bash
 npm install -g @openharnes/harnes
-# or: curl -fsSL https://openharnes.com/install | bash
+# or
+curl -fsSL https://openharnes.com/install | bash
 harnes
 ```
 
@@ -24,3 +25,4 @@ harnes run "explain this repo"
 - [Product](docs/product.md)
 - [Models](docs/models.md)
 - [GitHub](https://github.com/openharnes/harnes)
+- [npm](https://www.npmjs.com/package/@openharnes/harnes)
