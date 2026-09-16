@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Models — OpenHarnes docs</title>
+<meta name="description" content="OpenHarnes providers, live OpenRouter catalog filters, curated defaults, tiers, and agent tools." />
+<meta name="robots" content="index, follow" />
+<link rel="canonical" href="https://openharnes.com/docs/models.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="OpenHarnes" />
+<meta property="og:title" content="Models — OpenHarnes docs" />
+<meta property="og:description" content="Providers, live OpenRouter catalog, curated defaults, tiers, and agent tools." />
+<meta property="og:url" content="https://openharnes.com/docs/models.html" />
+<meta name="theme-color" content="#0a0a0a" />
+<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+<style>
+  :root { --bg:#0a0a0a; --panel:#111; --border:#262626; --text:#e5e5e5; --muted:#8a8a8a; --accent:#fff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size:14px; line-height:1.6; }
+  a { color: inherit; }
+  .container { max-width:720px; margin:0 auto; padding:0 24px; }
+  header { border-bottom:1px solid var(--border); padding:20px 0; }
+  .nav { display:flex; align-items:center; justify-content:space-between; max-width:900px; margin:0 auto; padding:0 24px; }
+  .logo { font-weight:700; letter-spacing:-0.5px; font-size:18px; text-decoration:none; }
+  nav ul { list-style:none; display:flex; gap:28px; margin:0; padding:0; color:var(--muted); align-items:center; }
+  nav ul a { text-decoration:none; }
+  nav ul a:hover, nav ul a.current { color:var(--text); }
+  .btn { background:var(--accent); color:#000; border:none; padding:8px 16px; border-radius:4px; font:inherit; font-size:13px; font-weight:600; text-decoration:none; }
+  .breadcrumb { color:var(--muted); font-size:12px; padding:24px 0 0; }
+  main { padding:16px 0 64px; }
+  h1 { font-size:26px; margin:24px 0 8px; letter-spacing:-0.5px; }
+  .oneliner { color:var(--muted); margin:0 0 32px; font-size:15px; }
+  .oneliner b { color:var(--text); }
+  h2 { font-size:16px; margin:40px 0 14px; padding-top:20px; border-top:1px solid var(--border); }
+  p { color:#c9c9c9; margin:0 0 16px; }
+  ul.plain { margin:0 0 16px; padding-left:20px; color:#c9c9c9; }
+  ul.plain li { margin-bottom:6px; }
+  ul.plain b { color:var(--text); }
+  table { width:100%; border-collapse:collapse; margin:0 0 24px; font-size:13px; }
+  th, td { text-align:left; padding:10px 12px; border:1px solid var(--border); vertical-align:top; }
+  th { color:var(--muted); background:var(--panel); }
+  td { color:#c9c9c9; }
+  code { background:var(--panel); border:1px solid var(--border); border-radius:3px; padding:1px 6px; font-size:12.5px; color:#8bd5a8; }
+  pre { background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:14px 16px; overflow-x:auto; margin:0 0 24px; font-size:12.5px; line-height:1.7; }
+  pre code { background:none; border:none; padding:0; color:#c9c9c9; }
+  pre .k { color:#8bd5a8; } pre .u { color:#82aaff; } pre .d { color:var(--muted); }
+  footer { padding:24px 0; color:var(--muted); font-size:12px; text-align:center; border-top:1px solid var(--border); }
+  @media (max-width:640px) { .container,.nav { padding:0 16px; } nav ul { gap:16px; } h1 { font-size:22px; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="nav">
+    <a class="logo" href="/">openharnes</a>
+    <nav>
+      <ul>
+        <li><a href="/docs/product.html">Docs</a></li>
+        <li><a class="current" href="/docs/models.html">Models</a></li>
+        <li><a class="btn" href="/#install">Install</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+<div class="container">
+  <p class="breadcrumb"><a href="/">openharnes</a> / <a href="/docs/product.html">docs</a> / models</p>
+  <main>
+    <h1>Models</h1>
+    <p class="oneliner">Default cloud path is <b>OpenRouter</b> (<code>OPENROUTER_API_KEY</code>). Local fallback is Ollama. Any OpenAI-compatible endpoint works via <code>HARNES_MODEL_BASE_URL</code>.</p>
+
+    <h2>Install</h2>
+    <pre><code><span class="u">npm</span> install -g <span class="k">@openharnes/harnes</span>
+<span class="d"># or</span>
+<span class="k">curl</span> -fsSL <span class="u">https://openharnes.com/install</span> | bash</code></pre>
+
+    <h2>Providers</h2>
+    <table>
+      <thead><tr><th>Provider</th><th>When</th></tr></thead>
+      <tbody>
+        <tr><td><code>openrouter</code></td><td><code>OPENROUTER_API_KEY</code> set (preferred)</td></tr>
+        <tr><td><code>ollama</code></td><td>local <code>http://127.0.0.1:11434/v1</code></td></tr>
+        <tr><td><code>openai-compatible</code></td><td>any <code>HARNES_MODEL_BASE_URL</code> (+ optional <code>HARNES_MODEL_API_KEY</code>)</td></tr>
+      </tbody>
+    </table>
+    <pre><code><span class="d">export</span> OPENROUTER_API_KEY=<span class="k">sk-or-...</span>
+<span class="u">harnes</span>                 <span class="d"># persistent session</span>
+<span class="u">harnes</span> models
+<span class="u">harnes</span> run <span class="k">"explain this repo"</span></code></pre>
+
+    <h2>Live catalog</h2>
+    <p><code>/models</code> and <code>harnes models</code> fetch OpenRouter&rsquo;s live list, cache it ~1h at <code>~/.cache/harnes/openrouter-models.json</code>, and fall back to the curated list offline.</p>
+    <p><b>Kept</b> (coding-capable + tool calling + context ≥ 8192): Qwen Coder, DeepSeek, Claude, GPT, Gemini, Llama 70B/72B/405B, Mixtral, Codestral.</p>
+    <p><b>Dropped:</b> tiny/weak names (2B–4B, tinyllama, phi-mini, …), no tool-call support, or context &lt; 8192.</p>
+    <p>Pin any listed id: <code>/model qwen/qwen3-coder</code> or <code>/model auto</code>.</p>
+
+    <h2>Curated defaults (offline fallback)</h2>
+    <table>
+      <thead><tr><th>Tier</th><th>Id</th><th>OpenRouter</th><th>Ctx</th><th>Role</th></tr></thead>
+      <tbody>
+        <tr><td>strong-open</td><td><code>qwen3-coder-30b</code></td><td><code>qwen/qwen3-coder</code></td><td>65k</td><td>Default build / agent work</td></tr>
+        <tr><td>fast-open</td><td><code>qwen3-coder-8b</code></td><td><code>qwen/qwen3-coder-flash</code></td><td>32k</td><td>Explore / compact</td></tr>
+        <tr><td>strong-open</td><td><code>deepseek-v3</code></td><td><code>deepseek/deepseek-chat-v3-0324</code></td><td>65k</td><td>Open-weight daily driver</td></tr>
+        <tr><td>frontier-byok</td><td><code>claude-sonnet</code></td><td><code>anthropic/claude-sonnet-4.5</code></td><td>200k</td><td>Hard architecture (BYOK)</td></tr>
+        <tr><td>frontier-byok</td><td><code>gpt-5</code></td><td><code>openai/gpt-5</code></td><td>128k</td><td>Hard architecture (BYOK)</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Tiers &amp; routing</h2>
+    <ul class="plain">
+      <li><b>fast-open</b> — explore, titles, compaction</li>
+      <li><b>strong-open</b> — default agent loop (auto/build)</li>
+      <li><b>frontier-byok</b> — only when frontier is allowed / pinned</li>
+    </ul>
+    <pre><code><span class="u">harnes</span> route <span class="k">"explore this repo"</span>   <span class="d"># → fast-open</span>
+<span class="u">harnes</span> route <span class="k">"add a retry policy"</span>  <span class="d"># → strong-open</span>
+<span class="u">harnes</span> smoke</code></pre>
+
+    <h2>Session commands</h2>
+    <table>
+      <thead><tr><th>Command</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><code>/models</code></td><td>list live + curated catalog</td></tr>
+        <tr><td><code>/model</code></td><td>show active model</td></tr>
+        <tr><td><code>/model auto</code></td><td>hybrid route per prompt</td></tr>
+        <tr><td><code>/model &lt;id&gt;</code></td><td>pin a catalog / OpenRouter slug</td></tr>
+        <tr><td><code>/mode auto|plan|build</code></td><td>tools + routing mode</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Tools (agent)</h2>
+    <table>
+      <thead><tr><th>Mode</th><th>Tools</th></tr></thead>
+      <tbody>
+        <tr><td>plan</td><td><code>read_file</code>, <code>glob</code>, <code>grep</code>, <code>list_dir</code></td></tr>
+        <tr><td>build</td><td>+ <code>write_file</code>, <code>bash</code></td></tr>
+      </tbody>
+    </table>
+    <p><code>harnes smoke</code> is the agentic gate: file-edit class models only, no weak defaults.</p>
+  </main>
+  <footer>&copy; 2026 OpenHarnes — CLI: harnes</footer>
+</div>
+</body>
+</html>

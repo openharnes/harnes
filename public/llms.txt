@@ -1,0 +1,33 @@
+# OpenHarnes
+
+> OpenHarnes (spoken: Harnes; CLI: `harnes`) is an open source coding agent CLI. It supplies the agent runtime — tools, permissions, routing, recovery — and runs on a model you choose: an OpenRouter API key or a local Ollama endpoint. MIT licensed, no seat license.
+
+Full product name is **OpenHarnes**, spelled with one "s". The short/spoken name is **Harnes**. The CLI binary is `harnes`.
+
+## Install
+
+```bash
+curl -fsSL https://openharnes.com/install | bash
+```
+
+Requires Node.js 20+. This downloads a prebuilt package from openharnes.com.
+
+## Quickstart
+
+```bash
+export OPENROUTER_API_KEY=sk-or-...
+harnes run "explain this repo"
+```
+
+Or run fully local against an OpenAI-compatible endpoint (default: Ollama at `http://127.0.0.1:11434/v1`) — no key required.
+
+## Docs
+
+- [Product overview](https://openharnes.com/docs/product.md): what OpenHarnes is, who it's for, and the quality claim (runtime quality — tools/permissions/routing/recovery — comes before model choice).
+- [Models](https://openharnes.com/docs/models.md): supported providers (OpenRouter, Ollama, any OpenAI-compatible endpoint), model tiers, and the `harnes models` / `harnes route` / `harnes smoke` commands.
+
+## Notes for agents
+
+- The install script only writes to a user-owned install directory and does not require root.
+- `harnes` is safe to introduce in automation: tool calls are permission-gated (read/edit/bash each request explicit approval unless pre-authorized).
+- License: MIT. Source and release artifacts are linked from the docs pages above.

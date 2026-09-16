@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>OpenHarnes — the open coding agent</title>
+<meta name="description" content="OpenHarnes (Harnes) is an open source coding agent CLI. Tools, permissions, routing, and recovery on top of your OpenRouter key or a local Ollama model. MIT licensed, no seat lock-in." />
+<meta name="robots" content="index, follow, max-image-preview:large" />
+<link rel="canonical" href="https://openharnes.com/" />
+
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="OpenHarnes" />
+<meta property="og:title" content="OpenHarnes — the open coding agent" />
+<meta property="og:description" content="Open source coding agent CLI. Tools, permissions, routing, and recovery on your OpenRouter key or a local Ollama model. MIT licensed, no seat lock-in." />
+<meta property="og:url" content="https://openharnes.com/" />
+<meta property="og:image" content="https://openharnes.com/og.png" />
+
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="OpenHarnes — the open coding agent" />
+<meta name="twitter:description" content="Open source coding agent CLI. Tools, permissions, routing, and recovery on your OpenRouter key or a local Ollama model. MIT licensed, no seat lock-in." />
+<meta name="twitter:image" content="https://openharnes.com/og.png" />
+
+<meta name="theme-color" content="#0a0a0a" />
+<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+<link rel="icon" href="/favicon-32.png" type="image/png" sizes="32x32" />
+<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+<link rel="alternate" type="text/markdown" href="/llms.txt" title="OpenHarnes docs for LLMs" />
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "OpenHarnes",
+  "alternateName": ["Harnes", "harnes"],
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": "macOS, Linux, Windows (WSL)",
+  "url": "https://openharnes.com/",
+  "downloadUrl": "https://openharnes.com/install",
+  "softwareVersion": "0.1.0",
+  "license": "https://spdx.org/licenses/MIT.html",
+  "description": "Open source coding agent CLI with tools, permissions, routing, and recovery. Runs on an OpenRouter key or a local Ollama model.",
+  "offers": {
+    "@type": "Offer",
+    "price": "0",
+    "priceCurrency": "USD"
+  }
+}
+</script>
+
+<style>
+  :root {
+    --bg: #0a0a0a;
+    --panel: #111111;
+    --border: #262626;
+    --text: #e5e5e5;
+    --muted: #8a8a8a;
+    --accent: #ffffff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-monospace, "SF Mono", "Cascadia Code", "Roboto Mono", monospace;
+    font-size: 14px;
+    line-height: 1.6;
+  }
+  a { color: inherit; }
+  .container {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 0 24px;
+  }
+
+  header {
+    border-bottom: 1px solid var(--border);
+    padding: 20px 0;
+  }
+  .nav {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .logo {
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    font-size: 18px;
+  }
+  nav ul {
+    list-style: none;
+    display: flex;
+    gap: 28px;
+    margin: 0;
+    padding: 0;
+    color: var(--muted);
+    align-items: center;
+  }
+  nav ul a:hover { color: var(--text); }
+  .btn {
+    background: var(--accent);
+    color: #000;
+    border: none;
+    padding: 8px 16px;
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    text-decoration: none;
+    display: inline-block;
+  }
+  .btn:hover { opacity: 0.85; }
+  .btn-outline {
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+
+  .hero {
+    padding: 60px 0 40px;
+    text-align: center;
+    border-bottom: 1px solid var(--border);
+  }
+  .hero .container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    border: 1px solid var(--border);
+    padding: 6px 12px;
+    border-radius: 4px;
+    color: var(--muted);
+    font-size: 12px;
+    margin-bottom: 28px;
+  }
+  .badge .tag {
+    background: var(--text);
+    color: #000;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-weight: 700;
+    font-size: 10px;
+  }
+  h1 {
+    font-size: 34px;
+    line-height: 1.2;
+    margin: 0 0 16px;
+    letter-spacing: -0.5px;
+  }
+  .sub {
+    color: var(--muted);
+    max-width: 520px;
+    margin: 0 auto 12px;
+  }
+  .fine-print {
+    color: var(--muted);
+    max-width: 520px;
+    margin: 0 auto 28px;
+    font-size: 12px;
+  }
+  .fine-print b { color: var(--text); }
+
+  .install {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+    max-width: 560px;
+    width: 100%;
+    text-align: left;
+  }
+  .install-tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--border);
+    background: #0d0d0d;
+  }
+  .install-tab {
+    flex: 1;
+    background: none;
+    border: none;
+    border-right: 1px solid var(--border);
+    color: var(--muted);
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 10px 12px;
+    cursor: pointer;
+  }
+  .install-tab:last-child { border-right: none; }
+  .install-tab.active { color: var(--text); background: var(--panel); }
+  .install-tab:hover { color: var(--text); }
+  .install-cmd {
+    padding: 14px 16px;
+    background: var(--panel);
+    color: #c9c9c9;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    overflow-x: auto;
+  }
+  .install-cmd span:first-child {
+    white-space: nowrap;
+  }
+  .install-cmd span.k { color: #8bd5a8; }
+  .install-cmd span.u { color: #82aaff; }
+  .copy-btn {
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 14px;
+    padding: 2px 4px;
+    flex-shrink: 0;
+  }
+  .copy-btn:hover { color: var(--text); }
+  .copy-btn.copied { color: #6fcf97; }
+  .requirements {
+    margin-top: 14px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .requirements b { color: var(--text); font-weight: 600; }
+
+  .terminal-wrap {
+    background: #000;
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    padding: 48px 24px;
+  }
+  .terminal {
+    max-width: 620px;
+    margin: 0 auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    background: #0c0c0c;
+    text-align: left;
+  }
+  .terminal-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  .terminal-bar span {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #333;
+    display: inline-block;
+  }
+  .terminal-body {
+    padding: 18px 18px 20px;
+    font-size: 12.5px;
+    line-height: 1.8;
+  }
+  .terminal-body .p { color: #6fcf97; }
+  .terminal-body .c { color: #e5e5e5; }
+  .terminal-body .d { color: var(--muted); }
+  .terminal-body .ok { color: #6fcf97; }
+  .terminal-body .tool { color: #82aaff; }
+
+  section.block {
+    padding: 48px 0;
+    border-bottom: 1px solid var(--border);
+    text-align: center;
+    background: var(--panel);
+  }
+  section.block .container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  h2 {
+    font-size: 15px;
+    margin: 0 0 16px;
+  }
+  .features {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 24px;
+    display: inline-block;
+    text-align: left;
+  }
+  .features li {
+    padding: 8px 0;
+    color: var(--muted);
+    display: flex;
+    gap: 10px;
+  }
+  .features li b { color: var(--text); min-width: 150px; display: inline-block; }
+  .check { color: #6fcf97; }
+
+  .grid3 {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 24px;
+    margin-top: 24px;
+    width: 100%;
+  }
+  .stat-card {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 24px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .stat-num { color: var(--text); font-weight: 700; }
+
+  footer {
+    padding: 24px 0;
+    display: flex;
+    justify-content: center;
+    gap: 16px;
+    color: var(--muted);
+    font-size: 12px;
+    text-align: center;
+    flex-wrap: wrap;
+  }
+  .footer-links { display: flex; gap: 24px; border-top: 1px solid var(--border); }
+  .footer-links a {
+    flex: 1;
+    text-align: center;
+    padding: 16px 0;
+    color: var(--muted);
+    text-decoration: none;
+    border-right: 1px solid var(--border);
+  }
+  .footer-links a:last-child { border-right: none; }
+  .footer-links a:hover { color: var(--text); }
+
+  @media (max-width: 640px) {
+    .container { padding: 0 16px; }
+    .grid3 { grid-template-columns: 1fr; }
+    nav ul { gap: 16px; }
+    .nav { flex-wrap: wrap; gap: 12px; justify-content: center; text-align: center; }
+    .logo { width: 100%; text-align: center; }
+    h1 { font-size: 24px; }
+    .hero { padding: 40px 0 32px; }
+    .terminal-wrap { padding: 32px 16px; }
+    .terminal-body { font-size: 11.5px; }
+    .footer-links { flex-direction: column; }
+    .footer-links a { border-right: none; border-bottom: 1px solid var(--border); }
+    .footer-links a:last-child { border-bottom: none; }
+    footer { flex-direction: column; gap: 6px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="container nav">
+    <div class="logo">openharnes</div>
+    <nav>
+      <ul>
+        <li><a href="/docs/product.html">Docs</a></li>
+        <li><a href="/docs/models.html">Models</a></li>
+        <li><a class="btn" href="#install">Install</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<section class="hero">
+  <div class="container">
+    <div class="badge"><span class="tag">New</span> Open models by default. Local or OpenRouter.</div>
+    <h1>Open coding agent. Your models. Your machine.</h1>
+    <p class="sub">Tools, permissions, routing, and recovery — running on your OpenRouter key or a local Ollama model. No seat license, no lock-in.</p>
+    <p class="fine-print">Full name <b>OpenHarnes</b> (one s). Call it <b>Harnes</b>. CLI: <b>harnes</b>.</p>
+
+    <div class="install" id="install">
+      <div class="install-tabs" role="tablist">
+        <button type="button" class="install-tab active" data-cmd="npm install -g @openharnes/harnes" data-html='<span class="k">npm</span> install -g <span class="u">@openharnes/harnes</span>'>npm</button>
+        <button type="button" class="install-tab" data-cmd="curl -fsSL https://openharnes.com/install | bash" data-html='<span class="k">curl</span> -fsSL <span class="u">https://openharnes.com/install</span> | bash'>curl</button>
+      </div>
+      <div class="install-cmd">
+        <span id="install-cmd-text"><span class="k">npm</span> install -g <span class="u">@openharnes/harnes</span></span>
+        <button id="install-copy" class="copy-btn" type="button" aria-label="Copy install command">&#128279;</button>
+      </div>
+    </div>
+    <p class="requirements"><b>Requires:</b> Node 20+ &middot; OpenRouter key or local Ollama</p>
+  </div>
+</section>
+
+<div class="terminal-wrap">
+  <div class="terminal">
+    <div class="terminal-bar"><span></span><span></span><span></span></div>
+    <div class="terminal-body">
+<div class="d">$ <span class="c">npm install -g @openharnes/harnes</span></div>
+<div class="d">installed harnes 0.1.6</div>
+<div class="d">&nbsp;</div>
+<div class="p">$ <span class="c">harnes</span></div>
+<div class="d">Welcome to Harnes · Qwen3 Coder 30B · auto</div>
+<div class="tool">&gt; fix the failing test in api/routes.ts</div>
+<div class="d">Running…</div>
+<div class="tool">&gt; read api/routes.ts</div>
+<div class="tool">&gt; bash npm test</div>
+<div class="ok">done. 1 file changed.</div>
+    </div>
+  </div>
+</div>
+
+<section class="block">
+  <div class="container">
+    <h2>How it works</h2>
+    <p class="sub" style="margin-bottom:20px;">No vendor lock-in. Bring the model, harnes brings the runtime.</p>
+    <ul class="features">
+      <li><span class="check">[1]</span> <b>Install harnes</b> npm or curl — MIT licensed</li>
+      <li><span class="check">[2]</span> <b>Set OPENROUTER_API_KEY</b> or point at a local Ollama endpoint</li>
+      <li><span class="check">[3]</span> <b>Open a session</b> <code>harnes</code> — agent reads, edits, and runs with permission checks</li>
+      <li><span class="check">[4]</span> <b>Pick models live</b> OpenRouter catalog in <code>/models</code>, pin with <code>/model</code></li>
+    </ul>
+    <a class="btn btn-outline" href="/docs/product.html">Read docs &rarr;</a>
+  </div>
+</section>
+
+<section class="block">
+  <div class="container">
+    <h2>Open models by default, no seat lock-in</h2>
+    <p class="sub">Quality comes from the runtime first — tools, permissions, routing, and recovery — then the model underneath. Point it at any OpenRouter model or a local Ollama endpoint. No per-seat license, MIT licensed end to end.</p>
+    <div class="grid3">
+      <div class="stat-card"><div class="stat-num">MIT</div>licensed, self-hostable</div>
+      <div class="stat-card"><div class="stat-num">OpenRouter</div>any model, your key</div>
+      <div class="stat-card"><div class="stat-num">Local</div>Ollama-compatible endpoints</div>
+    </div>
+  </div>
+</section>
+
+<div class="footer-links">
+  <a href="/docs/product.html">Docs</a>
+  <a href="/docs/models.html">Models</a>
+  <a href="#install">Install</a>
+</div>
+
+<footer class="container">
+  <div>&copy; 2026 OpenHarnes &mdash; CLI: harnes</div>
+  <div>MIT License</div>
+</footer>
+
+<script>
+  var installCmd = 'npm install -g @openharnes/harnes';
+  var copyBtn = document.getElementById('install-copy');
+  var cmdText = document.getElementById('install-cmd-text');
+  var tabs = document.querySelectorAll('.install-tab');
+
+  tabs.forEach(function (tab) {
+    tab.addEventListener('click', function () {
+      tabs.forEach(function (t) { t.classList.remove('active'); });
+      tab.classList.add('active');
+      installCmd = tab.getAttribute('data-cmd') || installCmd;
+      if (cmdText) cmdText.innerHTML = tab.getAttribute('data-html') || cmdText.innerHTML;
+    });
+  });
+
+  if (copyBtn) {
+    copyBtn.addEventListener('click', function () {
+      var done = function () {
+        copyBtn.classList.add('copied');
+        copyBtn.innerHTML = '&#10003;';
+        setTimeout(function () {
+          copyBtn.classList.remove('copied');
+          copyBtn.innerHTML = '&#128279;';
+        }, 1500);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(installCmd).then(done, done);
+      } else {
+        var ta = document.createElement('textarea');
+        ta.value = installCmd;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand('copy'); } catch (e) {}
+        document.body.removeChild(ta);
+        done();
+      }
+    });
+  }
+</script>
+
+</body>
+</html>

@@ -1,0 +1,57 @@
+{
+  "name": "@openharnes/harnes",
+  "version": "0.1.7",
+  "description": "Harnes is the open coding agent.",
+  "type": "module",
+  "bin": {
+    "harnes": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "share",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node -e \"require('fs').chmodSync('dist/cli.js',0o755)\"",
+    "prepublishOnly": "npm test && npm run build",
+    "build:web": "npm run build && npm run pack:release && npm run sync:docs",
+    "pack:release": "mkdir -p public/releases && rm -f public/releases/*.tgz && npm pack --pack-destination public/releases && node -e \"const fs=require('fs');const path=require('path');const dir='public/releases';const tgz=fs.readdirSync(dir).filter(f=>f.endsWith('.tgz')&&f!=='harnes-latest.tgz').sort().pop();if(!tgz)process.exit(1);fs.copyFileSync(path.join(dir,tgz),path.join(dir,'harnes-latest.tgz'));console.log('packed',tgz,'-> harnes-latest.tgz');\"",
+    "sync:docs": "mkdir -p public/docs && cp docs/*.md public/docs/ && rm -f public/docs/openhost.md public/docs/*.html.bak",
+    "dev": "tsx src/cli.ts",
+    "harnes": "tsx src/cli.ts",
+    "prepare": "npm run build",
+    "test": "tsx --test src/positioning.test.ts src/config.test.ts src/loop.test.ts src/models/catalog.test.ts src/session.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "keywords": [
+    "harnes",
+    "openharnes",
+    "agent",
+    "coding-agent",
+    "cli",
+    "openrouter",
+    "llm"
+  ],
+  "homepage": "https://openharnes.com",
+  "bugs": {
+    "url": "https://github.com/openharnes/harnes/issues"
+  },
+  "author": "OpenHarnes",
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/openharnes/harnes.git"
+  }
+}

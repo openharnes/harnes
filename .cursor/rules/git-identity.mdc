@@ -1,0 +1,10 @@
+---
+description: Brand-only git authorship for OpenHarnes
+alwaysApply: true
+---
+
+# Git identity
+
+- Commit author must be `OpenHarnes <opensource@openharnes.com>` (repo-local git config).
+- Do not add `Co-authored-by: Cursor` / cursoragent trailers.
+- Do not use personal names or emails in commits, package author, or public docs.
