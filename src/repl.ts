@@ -9,7 +9,7 @@ import {
 } from "./config.ts";
 import { LocalBackend } from "./exec/local.ts";
 import { openaiCompatibleComplete, runAgentLoop, type ChatMessage } from "./loop.ts";
-import { getModel, listOpenRouterModels, MODEL_CATALOG, OPENROUTER_BASE_URL, OLLAMA_BASE_URL } from "./models/catalog.ts";
+import { getModel, listOpenRouterModels, MODEL_CATALOG, OPENROUTER_BASE_URL, OLLAMA_BASE_URL, normalizeModelId } from "./models/catalog.ts";
 import { ONE_LINER, PRODUCT_NAME, SHORT_NAME } from "./positioning.ts";
 import {
   formatFooterLines,
@@ -96,6 +96,20 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
   if (firstRun) {
     printWelcomeBox(config, cwd, history, { firstRun: true });
     config = await runSetup(config, { nested: false });
+  }
+
+  if (config.pinnedModelId) {
+    try {
+      getModel(config.pinnedModelId);
+    } catch {
+      const bad = config.pinnedModelId;
+      const next = { ...config };
+      delete next.pinnedModelId;
+      config = next;
+      await saveConfig(config);
+      console.log(paint(ansi.warm, `Cleared invalid pinned model '${bad}'. Using auto-route.`));
+      console.log("");
+    }
   }
 
   printWelcomeBox(config, cwd, history, { firstRun: false });
@@ -431,9 +445,19 @@ async function setModel(
     return;
   }
   try {
-    const model = getModel(arg);
-    await ctx.setConfig({ ...ctx.getConfig(), pinnedModelId: model.id });
-    console.log(`Pinned ${model.name} (${model.id}) · ctx ${model.minContext.toLocaleString()}`);
+    // Warm the live catalog so OpenRouter slugs resolve when pinning.
+    const endpoint = resolveChatEndpoint(ctx.getConfig());
+    if (endpoint.provider === "openrouter") {
+      try {
+        await listOpenRouterModels({ apiKey: endpoint.apiKey });
+      } catch {
+        /* curated fallback is enough */
+      }
+    }
+    const model = getModel(normalizeModelId(arg));
+    const pinId = model.openrouterModel ?? model.id;
+    await ctx.setConfig({ ...ctx.getConfig(), pinnedModelId: pinId });
+    console.log(`Pinned ${model.name} (${pinId}) · ctx ${model.minContext.toLocaleString()}`);
   } catch (error) {
     console.log(error instanceof Error ? error.message : String(error));
   }

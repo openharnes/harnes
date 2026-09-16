@@ -106,9 +106,15 @@ const CODING_CAPABLE_PATTERN =
 const FRONTIER_PROVIDERS = new Set(["anthropic", "openai", "google"]);
 const FAST_TIER_PATTERN = /(flash|mini|lite|\b7b\b|\b8b\b|\b9b\b)/i;
 
+export function normalizeModelId(id: string): string {
+  // Shell/path typos sometimes produce "~provider/model" or quoted ids.
+  return id.trim().replace(/^~+/, "").replace(/^["']|["']$/g, "");
+}
+
 export function getModel(id: string): ModelSpec {
+  const normalized = normalizeModelId(id);
   const matches = (model: ModelSpec) =>
-    model.id === id || model.providerModel === id || model.openrouterModel === id;
+    model.id === normalized || model.providerModel === normalized || model.openrouterModel === normalized;
   const found = MODEL_CATALOG.find(matches) ?? dynamicCatalog.find(matches);
   if (!found) {
     throw new Error(`Unknown model '${id}'. Run \`${CLI_HINT} models\` for the curated list.`);

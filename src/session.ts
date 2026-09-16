@@ -41,7 +41,11 @@ export function resolveActiveModel(config: HarnesConfig, prompt?: string): {
   routing: "auto" | "pinned";
 } {
   if (config.pinnedModelId) {
-    return { model: getModel(config.pinnedModelId), routing: "pinned" };
+    try {
+      return { model: getModel(config.pinnedModelId), routing: "pinned" };
+    } catch {
+      // Stale / typo'd pin (e.g. "~provider/slug") — fall back to auto rather than crash startup.
+    }
   }
   const kind = prompt ? inferRouteKind(prompt) : "build";
   return { model: routeTask(kind, config.router), routing: "auto" };
