@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import { DEFAULT_CONFIG } from "./config.ts";
 import {
   estimateTokens,
+  formatFooterChrome,
   formatFooterLines,
   formatFooterStatus,
   formatTokenBar,
@@ -11,6 +12,8 @@ import {
   resolveActiveModel,
   resolveSession,
   cycleSessionMode,
+  splitStatusLine,
+  shortPath,
 } from "./session.ts";
 import { needsApproval } from "./exec/types.ts";
 
@@ -68,12 +71,33 @@ describe("session", () => {
     assert.equal(estimateTokens([{ role: "user", content: "abcd" }]), 1);
   });
 
-  it("formats the bottom status strip with mode label", () => {
+  it("formats Copilot-style chrome with model on the right", () => {
     const session = resolveSession(DEFAULT_CONFIG, []);
-    const [line1, line2] = formatFooterLines(session);
-    assert.match(line1, /^→ /);
-    assert.match(line2, /ask on edit|automatic|manual|plan/);
-    assert.match(line2, /⌃T\/⇧Tab/);
-    assert.match(formatFooterStatus(session), /ctx /);
+    const chrome = formatFooterChrome({
+      session,
+      cwd: "/Users/demo/Code/OpenHarnes",
+      width: 80,
+      costUsd: 0.0021,
+      branch: "main",
+    });
+    assert.equal(chrome.separator.length, 80);
+    assert.match(chrome.status, /^ask on edit/);
+    assert.match(chrome.status, /Qwen3/);
+    assert.ok(chrome.status.indexOf("ask on edit") < chrome.status.indexOf("Qwen3"));
+    assert.match(chrome.bar, /◆ Harnes/);
+    assert.match(chrome.bar, /explorer/);
+    assert.match(chrome.bar, /main/);
+    assert.equal(shortPath("/Users/demo/Code/OpenHarnes", "/Users/demo"), "~/Code/OpenHarnes");
+    const [status, bar] = formatFooterLines(session, 0, undefined, "/tmp", 60);
+    assert.match(status, /⌃T cycle/);
+    assert.match(bar, /◆ Harnes/);
+    assert.match(formatFooterStatus(session), /⌃T cycle/);
+  });
+
+  it("splits status lines to the far edges", () => {
+    const line = splitStatusLine("left", "right", 20);
+    assert.equal(line.length, 20);
+    assert.ok(line.startsWith("left"));
+    assert.ok(line.endsWith("right"));
   });
 });

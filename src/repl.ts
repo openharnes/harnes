@@ -33,8 +33,9 @@ import { ONE_LINER, PRODUCT_NAME, SHORT_NAME } from "./positioning.ts";
 import { fetchOpenRouterKeyUsage, formatUsd } from "./openrouter/usage.ts";
 import {
   cycleSessionMode,
-  formatFooterLines,
+  formatFooterChrome,
   formatTokenBar,
+  gitBranch,
   normalizeSessionMode,
   resolveSession,
   type SessionUsage,
@@ -82,8 +83,8 @@ function startStatusLine(initial = "Running"): { update: (text: string) => void;
   };
 }
 
-const VERSION = "0.2.1";
-const FOOTER_ROWS = 3; // separator + 2 status lines
+const VERSION = "0.2.2";
+const FOOTER_ROWS = 3; // full-width rule + status + bottom bar
 
 const SLASH_COMMANDS: Array<{ cmd: string; help: string }> = [
   { cmd: "/help", help: "show commands" },
@@ -212,13 +213,26 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
 
   const footerBlock = (): string => {
     const session = resolveSession(config, history);
-    const width = Math.min(process.stdout.columns || 80, 88);
-    const [line1, line2] = formatFooterLines(session, usage.costUsd, lastDone || undefined);
-    return (
-      `${paint(ansi.dim, "─".repeat(width))}\n` +
-      `${paint(ansi.soft, line1)}\n` +
-      `${paint(ansi.warm, line2)}`
-    );
+    const width = process.stdout.columns || 80;
+    const chrome = formatFooterChrome({
+      session,
+      cwd,
+      width,
+      costUsd: usage.costUsd,
+      lastDone: lastDone || undefined,
+    });
+    const chip = (label: string) => `${ansi.inputBg}${ansi.inputFg} ${label} ${ansi.reset}`;
+    const branch = gitBranch(cwd);
+    const chips = [
+      chip("◆"),
+      chip("explorer"),
+      chip(shortCwd(cwd)),
+      ...(branch ? [chip(branch)] : []),
+    ].join(" ");
+    const barRight = session.routing === "pinned" ? "pinned" : "/mode";
+    const gap = Math.max(1, width - visibleWidth(chips) - barRight.length);
+    const bar = `${chips}${" ".repeat(gap)}${paint(ansi.muted, barRight)}`;
+    return `${paint(ansi.dim, chrome.separator)}\n${paint(ansi.muted, chrome.status)}\n${bar}`;
   };
 
   /** Keep the status strip under the input while typing (readline otherwise wipes it). */
