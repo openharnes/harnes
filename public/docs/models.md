@@ -1,6 +1,12 @@
 # Models
 
-Default cloud path is **OpenRouter** (`OPENROUTER_API_KEY`). Local fallback is Ollama. Any OpenAI-compatible endpoint works via `HARNES_MODEL_BASE_URL`.
+Harnes supports **three inference paths**. Same agent runtime for all of them.
+
+| Path | When | How |
+|---|---|---|
+| **OpenRouter** | Want every model, one key | `OPENROUTER_API_KEY` — live catalog in `/models` |
+| **OpenHost** | Host your own weights in the cloud | Point `HARNES_MODEL_BASE_URL` at your [OpenHost](https://openhost.sh) OpenAI-compatible endpoint |
+| **Local** | Fully on your machine | Ollama (default `http://127.0.0.1:11434/v1`) or any local OpenAI-compatible server |
 
 ## Install
 
@@ -10,37 +16,36 @@ npm install -g @openharnes/harnes
 curl -fsSL https://openharnes.com/install | bash
 ```
 
-## Providers
+## Providers (config)
 
 | Provider | When |
 |---|---|
-| `openrouter` | `OPENROUTER_API_KEY` is set (preferred) |
+| `openrouter` | `OPENROUTER_API_KEY` is set (preferred cloud path) |
+| `openai-compatible` | `HARNES_MODEL_BASE_URL` — OpenHost, vLLM, Fireworks, etc. |
 | `ollama` | local `http://127.0.0.1:11434/v1` |
-| `openai-compatible` | any `HARNES_MODEL_BASE_URL` (+ optional `HARNES_MODEL_API_KEY`) |
 
 ```bash
+# 1) OpenRouter
 export OPENROUTER_API_KEY=sk-or-...
-harnes                 # persistent session
-harnes models          # live + curated catalog
-harnes run "explain this repo"
+harnes
+
+# 2) OpenHost (or any hosted OpenAI-compatible URL)
+export HARNES_MODEL_BASE_URL=https://your-openhost-endpoint/v1
+export HARNES_MODEL_API_KEY=...
+harnes
+
+# 3) Local Ollama
+export HARNES_PROVIDER=ollama
+harnes
 ```
 
-## Live catalog
+## Live catalog (OpenRouter)
 
 `/models` and `harnes models` fetch OpenRouter’s live list (`GET /api/v1/models`), cache it ~1h at `~/.cache/harnes/openrouter-models.json`, and fall back to the curated list offline.
 
-**Kept** (coding-capable + tool calling + context ≥ 8192):
+**Kept** (coding-capable + tool calling + context ≥ 8192): Qwen Coder, DeepSeek, Claude, GPT, Gemini, Llama 70B/72B/405B, Mixtral, Codestral.
 
-- Qwen Coder family
-- DeepSeek
-- Claude
-- GPT
-- Gemini
-- Llama 70B / 72B / 405B
-- Mixtral
-- Codestral
-
-**Dropped:** tiny / weak names (2B–4B, tinyllama, phi-mini, …), no tool-call support, or context &lt; 8192.
+**Dropped:** tiny/weak names, no tool-call support, or context &lt; 8192.
 
 Pin any listed id: `/model qwen/qwen3-coder` or `/model auto`.
 
@@ -61,9 +66,9 @@ Pin any listed id: `/model qwen/qwen3-coder` or `/model auto`.
 - **frontier-byok** — only when frontier is allowed / pinned
 
 ```bash
-harnes route "explore this repo"   # → fast-open
-harnes route "add a retry policy"  # → strong-open
-harnes smoke                       # reject weak models
+harnes route "explore this repo"
+harnes route "add a retry policy"
+harnes smoke
 ```
 
 ## Session commands
@@ -82,5 +87,3 @@ harnes smoke                       # reject weak models
 |---|---|
 | plan | `read_file`, `glob`, `grep`, `list_dir` |
 | build | + `write_file`, `bash` |
-
-`harnes smoke` is the agentic gate: file-edit class models only, no weak defaults.

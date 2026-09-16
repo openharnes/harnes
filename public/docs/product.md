@@ -29,11 +29,14 @@ Teams that want an autonomous coding agent with open models (OpenRouter / local)
 - Agent loop with tools: read / write / bash / glob / grep / list_dir
 - Permissions: plan = read-only explore; build = write + bash
 - Hybrid routing: fast-open / strong-open / frontier-byok
+- **Three model paths:** OpenRouter (all models), OpenHost (host your own), or local Ollama
 - MIT licensed — no seat fee
 
 ## Quality claim
 
 We sell a strong **runtime** (tools, permissions, routing, recovery) with open models by default. We do not sell “Opus quality on any open-source model.”
+
+OpenHost is a separate product for hosting models; Harnes is the agent that talks to OpenRouter, OpenHost, or local endpoints.
 
 ## Links
 

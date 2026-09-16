@@ -66,7 +66,17 @@
   <p class="breadcrumb"><a href="/">openharnes</a> / <a href="/docs/product.html">docs</a> / models</p>
   <main>
     <h1>Models</h1>
-    <p class="oneliner">Default cloud path is <b>OpenRouter</b> (<code>OPENROUTER_API_KEY</code>). Local fallback is Ollama. Any OpenAI-compatible endpoint works via <code>HARNES_MODEL_BASE_URL</code>.</p>
+    <p class="oneliner">Three inference paths. Same Harnes agent for all of them.</p>
+
+    <h2>Three ways to bring a model</h2>
+    <table>
+      <thead><tr><th>Path</th><th>When</th><th>How</th></tr></thead>
+      <tbody>
+        <tr><td><b>OpenRouter</b></td><td>Every model, one key</td><td><code>OPENROUTER_API_KEY</code> — live <code>/models</code> catalog</td></tr>
+        <tr><td><b>OpenHost</b></td><td>Host your own weights</td><td><code>HARNES_MODEL_BASE_URL</code> → <a href="https://openhost.sh">openhost.sh</a> OpenAI-compatible endpoint</td></tr>
+        <tr><td><b>Local</b></td><td>Fully on your machine</td><td>Ollama at <code>http://127.0.0.1:11434/v1</code> (or any local OpenAI-compatible server)</td></tr>
+      </tbody>
+    </table>
 
     <h2>Install</h2>
     <pre><code><span class="u">npm</span> install -g <span class="k">@openharnes/harnes</span>
@@ -77,15 +87,22 @@
     <table>
       <thead><tr><th>Provider</th><th>When</th></tr></thead>
       <tbody>
-        <tr><td><code>openrouter</code></td><td><code>OPENROUTER_API_KEY</code> set (preferred)</td></tr>
+        <tr><td><code>openrouter</code></td><td><code>OPENROUTER_API_KEY</code> set (preferred cloud path)</td></tr>
+        <tr><td><code>openai-compatible</code></td><td><code>HARNES_MODEL_BASE_URL</code> — OpenHost, vLLM, etc.</td></tr>
         <tr><td><code>ollama</code></td><td>local <code>http://127.0.0.1:11434/v1</code></td></tr>
-        <tr><td><code>openai-compatible</code></td><td>any <code>HARNES_MODEL_BASE_URL</code> (+ optional <code>HARNES_MODEL_API_KEY</code>)</td></tr>
       </tbody>
     </table>
-    <pre><code><span class="d">export</span> OPENROUTER_API_KEY=<span class="k">sk-or-...</span>
-<span class="u">harnes</span>                 <span class="d"># persistent session</span>
-<span class="u">harnes</span> models
-<span class="u">harnes</span> run <span class="k">"explain this repo"</span></code></pre>
+    <pre><code><span class="d"># 1) OpenRouter</span>
+<span class="d">export</span> OPENROUTER_API_KEY=<span class="k">sk-or-...</span>
+<span class="u">harnes</span>
+
+<span class="d"># 2) OpenHost</span>
+<span class="d">export</span> HARNES_MODEL_BASE_URL=<span class="k">https://your-openhost-endpoint/v1</span>
+<span class="u">harnes</span>
+
+<span class="d"># 3) Local</span>
+<span class="d">export</span> HARNES_PROVIDER=<span class="k">ollama</span>
+<span class="u">harnes</span></code></pre>
 
     <h2>Live catalog</h2>
     <p><code>/models</code> and <code>harnes models</code> fetch OpenRouter&rsquo;s live list, cache it ~1h at <code>~/.cache/harnes/openrouter-models.json</code>, and fall back to the curated list offline.</p>

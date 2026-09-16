@@ -4,20 +4,20 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>OpenHarnes — the open coding agent</title>
-<meta name="description" content="OpenHarnes (Harnes) is an open source coding agent CLI. Tools, permissions, routing, and recovery on top of your OpenRouter key or a local Ollama model. MIT licensed, no seat lock-in." />
+<meta name="description" content="OpenHarnes (Harnes) is an open source coding agent CLI. Run models via OpenRouter, host them on OpenHost, or run locally with Ollama. MIT licensed." />
 <meta name="robots" content="index, follow, max-image-preview:large" />
 <link rel="canonical" href="https://openharnes.com/" />
 
 <meta property="og:type" content="website" />
 <meta property="og:site_name" content="OpenHarnes" />
 <meta property="og:title" content="OpenHarnes — the open coding agent" />
-<meta property="og:description" content="Open source coding agent CLI. Tools, permissions, routing, and recovery on your OpenRouter key or a local Ollama model. MIT licensed, no seat lock-in." />
+<meta property="og:description" content="Open coding agent CLI. OpenRouter for every model, OpenHost to host your own, or local Ollama. MIT licensed." />
 <meta property="og:url" content="https://openharnes.com/" />
 <meta property="og:image" content="https://openharnes.com/og.png" />
 
 <meta name="twitter:card" content="summary_large_image" />
 <meta name="twitter:title" content="OpenHarnes — the open coding agent" />
-<meta name="twitter:description" content="Open source coding agent CLI. Tools, permissions, routing, and recovery on your OpenRouter key or a local Ollama model. MIT licensed, no seat lock-in." />
+<meta name="twitter:description" content="Open coding agent CLI. OpenRouter, OpenHost, or local — bring any model. MIT licensed." />
 <meta name="twitter:image" content="https://openharnes.com/og.png" />
 
 <meta name="theme-color" content="#0a0a0a" />
@@ -38,7 +38,7 @@
   "downloadUrl": "https://openharnes.com/install",
   "softwareVersion": "0.1.0",
   "license": "https://spdx.org/licenses/MIT.html",
-  "description": "Open source coding agent CLI with tools, permissions, routing, and recovery. Runs on an OpenRouter key or a local Ollama model.",
+  "description": "Open source coding agent CLI. Use OpenRouter for all models, host your own on OpenHost, or run locally with Ollama.",
   "offers": {
     "@type": "Offer",
     "price": "0",
@@ -308,11 +308,28 @@
     border: 1px solid var(--border);
     border-radius: 6px;
     padding: 24px;
-    text-align: center;
+    text-align: left;
     color: var(--muted);
-    font-size: 12px;
+    font-size: 13px;
+    line-height: 1.55;
   }
-  .stat-num { color: var(--text); font-weight: 700; }
+  .stat-num {
+    color: var(--text);
+    font-weight: 700;
+    font-size: 15px;
+    margin-bottom: 8px;
+    letter-spacing: -0.2px;
+  }
+  .stat-card a { color: #82aaff; text-decoration: none; }
+  .stat-card a:hover { text-decoration: underline; }
+  .stat-card code {
+    background: #0a0a0a;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 1px 5px;
+    font-size: 11.5px;
+    color: #8bd5a8;
+  }
 
   footer {
     padding: 24px 0;
@@ -370,9 +387,9 @@
 
 <section class="hero">
   <div class="container">
-    <div class="badge"><span class="tag">New</span> Open models by default. Local or OpenRouter.</div>
-    <h1>Open coding agent. Your models. Your machine.</h1>
-    <p class="sub">Tools, permissions, routing, and recovery — running on your OpenRouter key or a local Ollama model. No seat license, no lock-in.</p>
+    <div class="badge"><span class="tag">New</span> OpenRouter · OpenHost · Local</div>
+    <h1>Open coding agent. Your models. Anywhere.</h1>
+    <p class="sub">Tools, permissions, routing, and recovery — then the model. Use OpenRouter for every model, host your own on OpenHost, or run fully local. Same Harnes runtime for all three.</p>
     <p class="fine-print">Full name <b>OpenHarnes</b> (one s). Call it <b>Harnes</b>. CLI: <b>harnes</b>.</p>
 
     <div class="install" id="install">
@@ -385,7 +402,7 @@
         <button id="install-copy" class="copy-btn" type="button" aria-label="Copy install command">&#128279;</button>
       </div>
     </div>
-    <p class="requirements"><b>Requires:</b> Node 20+ &middot; OpenRouter key or local Ollama</p>
+    <p class="requirements"><b>Requires:</b> Node 20+ &middot; then pick OpenRouter, OpenHost, or local</p>
   </div>
 </section>
 
@@ -407,29 +424,48 @@
   </div>
 </div>
 
-<section class="block">
+<section class="block" id="models">
   <div class="container">
-    <h2>How it works</h2>
-    <p class="sub" style="margin-bottom:20px;">No vendor lock-in. Bring the model, harnes brings the runtime.</p>
-    <ul class="features">
-      <li><span class="check">[1]</span> <b>Install harnes</b> npm or curl — MIT licensed</li>
-      <li><span class="check">[2]</span> <b>Set OPENROUTER_API_KEY</b> or point at a local Ollama endpoint</li>
-      <li><span class="check">[3]</span> <b>Open a session</b> <code>harnes</code> — agent reads, edits, and runs with permission checks</li>
-      <li><span class="check">[4]</span> <b>Pick models live</b> OpenRouter catalog in <code>/models</code>, pin with <code>/model</code></li>
-    </ul>
-    <a class="btn btn-outline" href="/docs/product.html">Read docs &rarr;</a>
+    <h2>Three ways to bring a model</h2>
+    <p class="sub" style="margin-bottom:8px;">Harnes is the agent. You choose where inference runs — we support all three.</p>
+    <div class="grid3">
+      <div class="stat-card">
+        <div class="stat-num">1 · OpenRouter</div>
+        Use their catalog — all models, one key. Best default for trying Qwen, DeepSeek, Claude, GPT, Gemini, and more without hosting anything.
+        <div style="margin-top:12px"><code>OPENROUTER_API_KEY</code></div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-num">2 · OpenHost</div>
+        Host your own model on <a href="https://openhost.sh">openhost.sh</a>. Point Harnes at the OpenHost OpenAI-compatible endpoint when you want private / self-hosted weights in the cloud.
+        <div style="margin-top:12px"><code>HARNES_MODEL_BASE_URL</code></div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-num">3 · Local</div>
+        Run fully on your machine with Ollama (or any OpenAI-compatible local server). No cloud key required.
+        <div style="margin-top:12px"><code>http://127.0.0.1:11434/v1</code></div>
+      </div>
+    </div>
   </div>
 </section>
 
 <section class="block">
   <div class="container">
-    <h2>Open models by default, no seat lock-in</h2>
-    <p class="sub">Quality comes from the runtime first — tools, permissions, routing, and recovery — then the model underneath. Point it at any OpenRouter model or a local Ollama endpoint. No per-seat license, MIT licensed end to end.</p>
-    <div class="grid3">
-      <div class="stat-card"><div class="stat-num">MIT</div>licensed, self-hostable</div>
-      <div class="stat-card"><div class="stat-num">OpenRouter</div>any model, your key</div>
-      <div class="stat-card"><div class="stat-num">Local</div>Ollama-compatible endpoints</div>
-    </div>
+    <h2>How it works</h2>
+    <p class="sub" style="margin-bottom:20px;">Same agent loop everywhere. Swap the model endpoint, not the harness.</p>
+    <ul class="features">
+      <li><span class="check">[1]</span> <b>Install harnes</b> npm or curl — MIT licensed</li>
+      <li><span class="check">[2]</span> <b>Pick a path</b> OpenRouter key, OpenHost endpoint, or local Ollama</li>
+      <li><span class="check">[3]</span> <b>Open a session</b> <code>harnes</code> — read, edit, bash with permissions</li>
+      <li><span class="check">[4]</span> <b>Pin models</b> <code>/models</code> + <code>/model</code> when using OpenRouter</li>
+    </ul>
+    <a class="btn btn-outline" href="/docs/models.html">Model docs &rarr;</a>
+  </div>
+</section>
+
+<section class="block">
+  <div class="container">
+    <h2>Runtime first, model second</h2>
+    <p class="sub">Quality comes from tools, permissions, routing, and recovery — then whatever model you plug in. No seat license. MIT end to end. OpenHost stays a separate product for hosting; Harnes is the agent that talks to it.</p>
   </div>
 </section>
 
