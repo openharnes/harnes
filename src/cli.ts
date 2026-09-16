@@ -3,6 +3,8 @@ import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { configFromEnv, loadConfig, resolveChatEndpoint, saveConfig, type HarnesConfig } from "./config.ts";
 import { LocalBackend } from "./exec/local.ts";
+import { permissionForSessionMode } from "./exec/types.ts";
+import { normalizeSessionMode } from "./session.ts";
 import { openaiCompatibleComplete, runAgentLoop } from "./loop.ts";
 import { MODEL_CATALOG, wireModelId } from "./models/catalog.ts";
 import { inferRouteKind, routeTask } from "./models/router.ts";
@@ -133,7 +135,7 @@ async function cmdRun(prompt: string, config: HarnesConfig): Promise<void> {
       prompt,
       model: { ...model, providerModel: wireModel },
       backend,
-      permissionMode: config.permissionMode,
+      permissionMode: permissionForSessionMode(normalizeSessionMode(config.sessionMode)),
       complete: (input) => openaiCompatibleComplete(endpoint.baseUrl, endpoint.apiKey, input),
     });
     const last = [...result.messages].reverse().find((message) => message.role === "assistant");

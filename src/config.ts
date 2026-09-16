@@ -1,4 +1,5 @@
 import type { PermissionMode, SessionMode } from "./exec/types.ts";
+import { normalizeSessionMode } from "./exec/types.ts";
 import {
   OLLAMA_BASE_URL,
   OPENROUTER_BASE_URL,
@@ -9,7 +10,10 @@ import { DEFAULT_ROUTER, type RouterConfig } from "./models/router.ts";
 
 export interface HarnesConfig {
   permissionMode: PermissionMode;
-  /** auto routes model + tool permissions per prompt; plan/build pin tools. */
+  /**
+   * Approval mode: auto | manual | ask | plan.
+   * Shift+Tab cycles these in the REPL. Legacy `build` is treated as `auto`.
+   */
   sessionMode: SessionMode;
   defaultTier: QualityTier;
   router: RouterConfig;
@@ -23,11 +27,16 @@ export interface HarnesConfig {
   pinnedModelId?: string;
   /** Set true after first-run setup completes. */
   setupComplete?: boolean;
+  /**
+   * When true, Harnes installs a newer npm release on startup (opt-in).
+   * Default is notify-only; use `/update auto on` to enable.
+   */
+  autoUpdate?: boolean;
 }
 
 export const DEFAULT_CONFIG: HarnesConfig = {
   permissionMode: "build",
-  sessionMode: "auto",
+  sessionMode: "ask",
   defaultTier: "strong-open",
   router: DEFAULT_ROUTER,
   provider: "ollama",
@@ -36,6 +45,7 @@ export const DEFAULT_CONFIG: HarnesConfig = {
     apiKey: "ollama",
   },
   setupComplete: false,
+  autoUpdate: false,
 };
 
 export function configPath(): string {
@@ -59,7 +69,8 @@ export async function loadConfig(): Promise<HarnesConfig> {
     const merged: HarnesConfig = {
       ...DEFAULT_CONFIG,
       ...rest,
-      sessionMode: rest.sessionMode ?? DEFAULT_CONFIG.sessionMode,
+      sessionMode: normalizeSessionMode(rest.sessionMode ?? DEFAULT_CONFIG.sessionMode),
+      autoUpdate: rest.autoUpdate ?? DEFAULT_CONFIG.autoUpdate,
       router: { ...DEFAULT_CONFIG.router, ...rest.router },
       provider: rest.provider ?? DEFAULT_CONFIG.provider,
       openaiCompatible: {
@@ -70,6 +81,7 @@ export async function loadConfig(): Promise<HarnesConfig> {
         apiKey: rest.openaiCompatible?.apiKey ?? DEFAULT_CONFIG.openaiCompatible?.apiKey,
       },
     };
+    merged.permissionMode = merged.sessionMode === "plan" ? "plan" : "build";
     return configFromEnv(merged);
   } catch {
     return configFromEnv({ ...DEFAULT_CONFIG });

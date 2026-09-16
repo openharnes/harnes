@@ -8,18 +8,38 @@ import {
   type HarnesConfig,
 } from "./config.ts";
 import { LocalBackend } from "./exec/local.ts";
-import { openaiCompatibleComplete, runAgentLoop, type ChatMessage, type LoopProgress } from "./loop.ts";
-import { getModel, listOpenRouterModels, MODEL_CATALOG, OPENROUTER_BASE_URL, OLLAMA_BASE_URL, normalizeModelId } from "./models/catalog.ts";
+import {
+  needsApproval,
+  permissionForSessionMode,
+  SESSION_MODE_LABELS,
+  SESSION_MODES,
+} from "./exec/types.ts";
+import {
+  openaiCompatibleComplete,
+  runAgentLoop,
+  type ChatMessage,
+  type LoopProgress,
+  type ToolCall,
+} from "./loop.ts";
+import {
+  getModel,
+  listOpenRouterModels,
+  MODEL_CATALOG,
+  OPENROUTER_BASE_URL,
+  OLLAMA_BASE_URL,
+  normalizeModelId,
+} from "./models/catalog.ts";
 import { ONE_LINER, PRODUCT_NAME, SHORT_NAME } from "./positioning.ts";
 import { fetchOpenRouterKeyUsage, formatUsd } from "./openrouter/usage.ts";
 import {
+  cycleSessionMode,
   formatFooterLines,
   formatTokenBar,
   normalizeSessionMode,
   resolveSession,
   type SessionUsage,
 } from "./session.ts";
-import type { SessionMode } from "./exec/types.ts";
+import { applyUpdate, checkForUpdate, NPM_PACKAGE } from "./update.ts";
 
 export type { SessionUsage };
 
@@ -62,7 +82,7 @@ function startStatusLine(initial = "Running"): { update: (text: string) => void;
   };
 }
 
-const VERSION = "0.1.9";
+const VERSION = "0.2.0";
 const FOOTER_ROWS = 3; // separator + 2 status lines
 
 const SLASH_COMMANDS: Array<{ cmd: string; help: string }> = [
@@ -72,9 +92,11 @@ const SLASH_COMMANDS: Array<{ cmd: string; help: string }> = [
   { cmd: "/model", help: "show / pin active model" },
   { cmd: "/model auto", help: "route per prompt" },
   { cmd: "/models", help: "list catalog" },
-  { cmd: "/mode", help: "auto | plan | build" },
+  { cmd: "/mode", help: "auto | manual | ask | plan  (⇧Tab)" },
   { cmd: "/usage", help: "session + OpenRouter spend" },
   { cmd: "/cost", help: "alias for /usage" },
+  { cmd: "/update", help: "check / install latest from npm" },
+  { cmd: "/update auto on", help: "opt-in: auto-install on startup" },
   { cmd: "/clear", help: "reset conversation memory" },
   { cmd: "/exit", help: "quit" },
 ];
@@ -83,14 +105,12 @@ const ansi = {
   reset: "\x1b[0m",
   bold: "\x1b[1m",
   dim: "\x1b[2m",
-  // Cool charcoal chrome (not green)
   accent: "\x1b[38;5;246m",
   accentBright: "\x1b[38;5;252m",
   muted: "\x1b[38;5;243m",
   cmd: "\x1b[38;5;147m",
-  soft: "\x1b[38;5;150m", // soft lime for model line
-  warm: "\x1b[38;5;215m", // amber for mode line
-  // Input bar ≈ #1a2024
+  soft: "\x1b[38;5;150m",
+  warm: "\x1b[38;5;215m",
   inputBg: "\x1b[48;2;26;32;36m",
   inputFg: "\x1b[38;5;252m",
 };
@@ -118,6 +138,14 @@ function padLine(content: string, inner: number): string {
 function promptPrefix(): string {
   return `${ansi.inputBg}${ansi.inputFg}${ansi.bold} › ${ansi.reset}${ansi.inputBg}${ansi.inputFg}`;
 }
+
+type TtyKey = { name?: string; shift?: boolean; ctrl?: boolean; meta?: boolean };
+
+type RlWithTty = readline.Interface & {
+  _ttyWrite?: (s: string | undefined, key: TtyKey) => void;
+  line?: string;
+  cursor?: number;
+};
 
 export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
   let config = initialConfig;
@@ -153,6 +181,8 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
     }
   }
 
+  config = await maybeHandleUpdateOnStart(config);
+
   printWelcomeBox(config, cwd, history, { firstRun: false });
 
   const rl = readline.createInterface({
@@ -160,38 +190,64 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
     output,
     terminal: true,
     completer: slashCompleter,
-  });
+  }) as RlWithTty;
 
   const showIdle = () => {
     const session = resolveSession(config, history);
     const width = Math.min(process.stdout.columns || 80, 88);
     const [line1, line2] = formatFooterLines(session, usage.costUsd);
     const plainPrompt = " › ";
+    const lineLen = (rl.line ?? "").length;
     rl.setPrompt(promptPrefix());
     output.write(ansi.reset);
-    // Always start the prompt at column 0 (cursor-up left the caret mid-line before).
     output.write("\r\x1b[0K");
     rl.prompt();
-    // Status sits BELOW the input bar (WOZ-style)
+    if (rl.line) output.write(rl.line);
     output.write(
       `\n${paint(ansi.dim, "─".repeat(width))}\n` +
         `${paint(ansi.soft, line1)}\n` +
         `${paint(ansi.warm, line2)}`
     );
-    // Return to the input line and park the caret after the prompt glyph.
-    output.write(`\x1b[${FOOTER_ROWS}A\x1b[${plainPrompt.length + 1}G`);
+    // Return to the input line; caret after prompt + typed text.
+    output.write(`\x1b[${FOOTER_ROWS}A\x1b[${plainPrompt.length + 1 + lineLen}G`);
   };
 
   const clearBelowInput = () => {
-    // Drop the parked footer after Enter so the transcript stays clean
     output.write(`${ansi.reset}\r\x1b[0J\n`);
   };
+
+  const cycleModeFromKey = async () => {
+    const nextMode = cycleSessionMode(normalizeSessionMode(config.sessionMode));
+    config = {
+      ...config,
+      sessionMode: nextMode,
+      permissionMode: permissionForSessionMode(nextMode),
+    };
+    await saveConfig(config);
+    // Redraw footer in place without dumping completer noise.
+    output.write("\x1b[0J");
+    showIdle();
+    // Toast on the status line briefly via stderr-adjacent write above footer
+    output.write(`\x1b[s\x1b[${FOOTER_ROWS}B\r\x1b[2K${paint(ansi.soft, `mode → ${SESSION_MODE_LABELS[nextMode]}`)}\x1b[u`);
+  };
+
+  // Shift+Tab must NOT run readline reverse-tab completion (that stacked the / menu).
+  const originalTtyWrite = rl._ttyWrite?.bind(rl);
+  if (originalTtyWrite) {
+    rl._ttyWrite = (s, key) => {
+      if (key?.name === "tab" && key.shift) {
+        void cycleModeFromKey();
+        return;
+      }
+      return originalTtyWrite(s, key);
+    };
+  }
 
   const shutdown = async () => {
     output.write(ansi.reset);
     rl.close();
     await backend.close();
-    printUsage(usage, config, history);
+    await printUsage(usage, config, history);
   };
 
   rl.on("SIGINT", () => {
@@ -226,6 +282,7 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
         history,
         usage,
         cwd,
+        rl,
       });
       if (done === "exit") break;
       showIdle();
@@ -233,7 +290,7 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
     }
 
     try {
-      await runTurn(text, config, backend, history, usage);
+      await runTurn(text, config, backend, history, usage, rl);
     } catch (error) {
       console.error(error instanceof Error ? error.message : error);
     }
@@ -243,9 +300,11 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
   await shutdown();
 }
 
+/** Only complete slash commands; never dump the full menu on bare Tab / reverse-Tab. */
 function slashCompleter(line: string): [string[], string] {
+  if (!line.startsWith("/")) return [[], line];
   const hits = SLASH_COMMANDS.map((c) => c.cmd).filter((c) => c.startsWith(line));
-  return [hits.length ? hits : SLASH_COMMANDS.map((c) => c.cmd), line];
+  return [hits, line];
 }
 
 function printWelcomeBox(
@@ -269,7 +328,7 @@ function printWelcomeBox(
     paint(ansi.bold, `Welcome to ${SHORT_NAME}`),
     "",
     paint(ansi.soft, "◆"),
-    paint(ansi.muted, `${session.model.name} · ${session.mode}`),
+    paint(ansi.muted, `${session.model.name} · ${session.modeLabel}`),
     paint(ansi.muted, shortCwd(cwd)),
   ];
   if (opts.firstRun) {
@@ -280,7 +339,7 @@ function printWelcomeBox(
     paint(ansi.accentBright, "Tips for getting started"),
     paint(ansi.cmd, "/help") + paint(ansi.muted, "  see all commands"),
     paint(ansi.cmd, "/model") + paint(ansi.muted, " pin Qwen / Claude / GPT"),
-    paint(ansi.cmd, "/mode") + paint(ansi.muted, "  auto | plan | build"),
+    paint(ansi.cmd, "/mode") + paint(ansi.muted, "  ⇧Tab cycle approvals"),
     "",
     paint(ansi.accentBright, "Recent activity"),
     history.length === 0
@@ -299,15 +358,19 @@ function printWelcomeBox(
   }
   console.log(bot);
   console.log(paint(ansi.muted, ONE_LINER));
-  console.log(paint(ansi.dim, "Type a task, or / for commands  ·  Tab to autocomplete"));
+  console.log(
+    paint(ansi.dim, "Type a task, or / for commands  ·  Tab autocomplete  ·  ⇧Tab cycle mode")
+  );
   console.log("");
 }
 
 function printSlashMenu(): void {
   console.log(paint(ansi.accentBright, "Commands"));
   for (const { cmd, help } of SLASH_COMMANDS) {
-    console.log(`  ${paint(ansi.cmd, cmd.padEnd(14))} ${paint(ansi.muted, help)}`);
+    console.log(`  ${paint(ansi.cmd, cmd.padEnd(18))} ${paint(ansi.muted, help)}`);
   }
+  console.log("");
+  console.log(paint(ansi.muted, "Modes (⇧Tab): automatic → manual → ask on edit → plan"));
 }
 
 function printWelcome(cwd: string): void {
@@ -341,7 +404,9 @@ async function runSetup(config: HarnesConfig, opts: { nested: boolean }): Promis
     console.log("Skipped. Run /setup when you have a key.");
   } else {
     const existing = process.env.OPENROUTER_API_KEY ?? config.openaiCompatible?.apiKey ?? "";
-    const keepHint = existing.startsWith("sk-or-") ? "OpenRouter API key (Enter to keep): " : "OpenRouter API key (sk-or-...): ";
+    const keepHint = existing.startsWith("sk-or-")
+      ? "OpenRouter API key (Enter to keep): "
+      : "OpenRouter API key (sk-or-...): ";
     const entered = (await rl.question(keepHint)).trim();
     const key = entered || (existing.startsWith("sk-or-") ? existing : "");
     if (!key) {
@@ -356,14 +421,53 @@ async function runSetup(config: HarnesConfig, opts: { nested: boolean }): Promis
     }
   }
 
-  const modeIn = (await rl.question("Default session mode [auto/plan/build] (Enter=auto): ")).trim();
-  next = { ...next, sessionMode: normalizeSessionMode(modeIn || "auto") };
-  next.permissionMode = next.sessionMode === "plan" ? "plan" : "build";
+  const modeIn = (
+    await rl.question("Default mode [auto/manual/ask/plan] (Enter=ask): ")
+  ).trim();
+  const sessionMode = normalizeSessionMode(modeIn || "ask");
+  next = {
+    ...next,
+    sessionMode,
+    permissionMode: permissionForSessionMode(sessionMode),
+  };
 
   rl.close();
   await saveConfig(next);
   console.log("");
   return next;
+}
+
+async function maybeHandleUpdateOnStart(config: HarnesConfig): Promise<HarnesConfig> {
+  try {
+    const check = await checkForUpdate(VERSION);
+    if (!check.updateAvailable) return config;
+
+    if (config.autoUpdate) {
+      console.log(
+        paint(ansi.warm, `Auto-update: ${check.current} → ${check.latest} (${NPM_PACKAGE})…`)
+      );
+      const result = await applyUpdate();
+      if (result.ok) {
+        console.log(paint(ansi.soft, `Updated to ${check.latest}. Restart Harnes to load it.`));
+      } else {
+        console.log(paint(ansi.muted, `Auto-update failed: ${result.output.slice(0, 200)}`));
+        console.log(paint(ansi.muted, `Run /update or: npm install -g ${NPM_PACKAGE}`));
+      }
+      console.log("");
+      return config;
+    }
+
+    console.log(
+      paint(
+        ansi.warm,
+        `Update available: ${check.current} → ${check.latest}  ·  /update  ·  /update auto on`
+      )
+    );
+    console.log("");
+  } catch {
+    /* offline / registry blip — ignore */
+  }
+  return config;
 }
 
 async function handleSlash(
@@ -374,6 +478,7 @@ async function handleSlash(
     history: ChatMessage[];
     usage: SessionUsage;
     cwd: string;
+    rl: readline.Interface;
   }
 ): Promise<"ok" | "exit"> {
   const [cmd, ...rest] = text.slice(1).split(/\s+/);
@@ -407,24 +512,29 @@ async function handleSlash(
       printFullStatus(ctx.getConfig(), ctx.history, ctx.cwd, ctx.usage);
       return "ok";
     }
+    case "update":
+      await handleUpdateCommand(ctx, arg);
+      return "ok";
     case "mode": {
-      if (arg && arg !== "auto" && arg !== "plan" && arg !== "build") {
-        console.log("Usage: /mode auto|plan|build");
-        return "ok";
-      }
       if (!arg) {
         const session = resolveSession(ctx.getConfig(), ctx.history);
-        console.log(`mode ${session.mode} (tools ${session.permissionMode})`);
+        console.log(`mode ${session.modeLabel} (${session.mode}) · tools ${session.permissionMode}`);
+        console.log(paint(ansi.muted, `cycle: ${SESSION_MODES.map((m) => SESSION_MODE_LABELS[m]).join(" → ")}`));
         return "ok";
       }
-      const sessionMode = arg as SessionMode;
+      const aliases = new Set(["auto", "automatic", "manual", "ask", "ask-on-edit", "plan", "build"]);
+      if (!aliases.has(arg.toLowerCase())) {
+        console.log("Usage: /mode auto|manual|ask|plan   (or ⇧Tab)");
+        return "ok";
+      }
+      const sessionMode = normalizeSessionMode(arg);
       await ctx.setConfig({
         ...ctx.getConfig(),
         sessionMode,
-        permissionMode: sessionMode === "plan" ? "plan" : "build",
+        permissionMode: permissionForSessionMode(sessionMode),
       });
       const session = resolveSession(ctx.getConfig(), ctx.history);
-      console.log(`mode ${session.mode} · tools ${session.permissionMode} · ${session.model.name}`);
+      console.log(`mode ${session.modeLabel} · tools ${session.permissionMode} · ${session.model.name}`);
       return "ok";
     }
     case "setup": {
@@ -436,6 +546,45 @@ async function handleSlash(
     default:
       console.log(`Unknown command /${cmd}. Try /help.`);
       return "ok";
+  }
+}
+
+async function handleUpdateCommand(
+  ctx: {
+    getConfig: () => HarnesConfig;
+    setConfig: (config: HarnesConfig) => Promise<void>;
+  },
+  arg: string
+): Promise<void> {
+  const parts = arg.split(/\s+/).filter(Boolean);
+  if (parts[0] === "auto") {
+    const on = parts[1] === "on" || parts[1] === "true" || parts[1] === "1";
+    const off = parts[1] === "off" || parts[1] === "false" || parts[1] === "0";
+    if (!on && !off) {
+      console.log(`auto-update is ${ctx.getConfig().autoUpdate ? "on" : "off"}  ·  /update auto on|off`);
+      return;
+    }
+    await ctx.setConfig({ ...ctx.getConfig(), autoUpdate: on });
+    console.log(on ? "Auto-update enabled (installs on startup when newer)." : "Auto-update disabled (notify only).");
+    return;
+  }
+
+  try {
+    const check = await checkForUpdate(VERSION, { force: true });
+    if (!check.updateAvailable) {
+      console.log(`Up to date (${check.current}).`);
+      return;
+    }
+    console.log(`Installing ${check.current} → ${check.latest}…`);
+    const result = await applyUpdate();
+    if (result.ok) {
+      console.log(paint(ansi.soft, `Installed ${check.latest}. Restart Harnes (quit + reopen) to load it.`));
+    } else {
+      console.log(paint(ansi.muted, result.output.slice(0, 400) || "npm install failed"));
+      console.log(`Try: npm install -g ${NPM_PACKAGE}`);
+    }
+  } catch (error) {
+    console.log(error instanceof Error ? error.message : String(error));
   }
 }
 
@@ -485,13 +634,12 @@ async function setModel(
     return;
   }
   try {
-    // Warm the live catalog so OpenRouter slugs resolve when pinning.
     const endpoint = resolveChatEndpoint(ctx.getConfig());
     if (endpoint.provider === "openrouter") {
       try {
         await listOpenRouterModels({ apiKey: endpoint.apiKey });
       } catch {
-        /* curated fallback is enough */
+        /* curated fallback */
       }
     }
     const model = getModel(normalizeModelId(arg));
@@ -503,12 +651,23 @@ async function setModel(
   }
 }
 
+function summarizeTool(call: ToolCall): string {
+  if (call.name === "write_file") return `write_file ${call.arguments.path ?? ""}`;
+  if (call.name === "bash") {
+    const cmd = call.arguments.command ?? "";
+    return `bash ${cmd.length > 80 ? `${cmd.slice(0, 77)}…` : cmd}`;
+  }
+  if (call.name === "read_file") return `read_file ${call.arguments.path ?? ""}`;
+  return `${call.name} ${JSON.stringify(call.arguments).slice(0, 60)}`;
+}
+
 async function runTurn(
   prompt: string,
   config: HarnesConfig,
   backend: LocalBackend,
   history: ChatMessage[],
-  usage: SessionUsage
+  usage: SessionUsage,
+  rl: readline.Interface
 ): Promise<void> {
   if (!hasUsableApiKey(config) && config.provider !== "ollama") {
     console.log("No API key configured. Run /setup first.");
@@ -516,9 +675,10 @@ async function runTurn(
   }
 
   const started = Date.now();
-  const status = startStatusLine("Running");
+  let status = startStatusLine("Running");
   const session = resolveSession(config, history, prompt);
   const endpoint = resolveChatEndpoint(config);
+  const mode = session.mode;
 
   try {
     const result = await runAgentLoop({
@@ -531,6 +691,16 @@ async function runTurn(
       onProgress: (event: LoopProgress) => {
         if (event.type === "thinking") status.update(`Thinking · step ${event.step}`);
         else status.update(`${event.name} · step ${event.step}`);
+      },
+      onApprove: async (call) => {
+        if (!needsApproval(mode, call.name)) return true;
+        status.stop();
+        const answer = (await rl.question(paint(ansi.warm, `Allow ${summarizeTool(call)}? [y/N] `)))
+          .trim()
+          .toLowerCase();
+        const ok = answer === "y" || answer === "yes";
+        status = startStatusLine(ok ? call.name : "Running");
+        return ok;
       },
     });
 
@@ -605,11 +775,13 @@ function printFullStatus(config: HarnesConfig, history: ChatMessage[], cwd: stri
   console.log(`baseUrl    ${endpoint.baseUrl}`);
   console.log(`key        ${maskKey(endpoint.apiKey)}`);
   console.log(`model      ${session.model.name} (${session.wireId}) [${session.routing}]`);
-  console.log(`mode       ${session.mode} · tools ${session.permissionMode}`);
+  console.log(`mode       ${session.modeLabel} (${session.mode}) · tools ${session.permissionMode}`);
+  console.log(`autoUpdate ${config.autoUpdate ? "on" : "off"}`);
   console.log(`context    ${formatTokenBar(session.tokensUsed, session.contextWindow)}`);
   console.log(`cwd        ${shortCwd(cwd)}`);
   console.log(`history    ${history.length} messages`);
   console.log(`usage      turns=${usage.turns} tools=${usage.toolCalls} spend=${formatUsd(usage.costUsd)}`);
+  console.log(`version    ${VERSION}`);
 }
 
 function maskKey(key: string | undefined): string {

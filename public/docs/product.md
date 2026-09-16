@@ -25,7 +25,8 @@ Teams that want an autonomous coding agent with open models (OpenRouter / local)
 
 ## What you get
 
-- Persistent REPL (`harnes`) with `/model`, `/mode`, `/usage`, live OpenRouter catalog + spend
+- Persistent REPL (`harnes`) with `/model`, `/mode`, `/usage`, `/update`, live OpenRouter catalog + spend
+- Shift+Tab cycles approval modes: automatic → manual → ask on edit → plan
 - Agent loop with tools: read / write / bash / glob / grep / list_dir
 - Permissions: plan = read-only explore; build = write + bash
 - Hybrid routing: fast-open / strong-open / frontier-byok

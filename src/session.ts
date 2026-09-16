@@ -1,11 +1,23 @@
 import type { HarnesConfig } from "./config.ts";
 import type { ChatMessage } from "./loop.ts";
-import type { PermissionMode, SessionMode } from "./exec/types.ts";
+import {
+  SESSION_MODE_LABELS,
+  normalizeSessionMode,
+  permissionForSessionMode,
+  type PermissionMode,
+  type SessionMode,
+} from "./exec/types.ts";
 import { getModel, wireModelId, type ModelSpec } from "./models/catalog.ts";
 import { inferRouteKind, routeTask } from "./models/router.ts";
 import { resolveChatEndpoint } from "./config.ts";
 
 export type { SessionMode } from "./exec/types.ts";
+export {
+  SESSION_MODES,
+  SESSION_MODE_LABELS,
+  cycleSessionMode,
+  normalizeSessionMode,
+} from "./exec/types.ts";
 
 export interface SessionUsage {
   turns: number;
@@ -19,6 +31,7 @@ export interface SessionUsage {
 export interface ActiveSession {
   mode: SessionMode;
   permissionMode: PermissionMode;
+  modeLabel: string;
   model: ModelSpec;
   wireId: string;
   routing: "auto" | "pinned";
@@ -26,17 +39,9 @@ export interface ActiveSession {
   contextWindow: number;
 }
 
-export function normalizeSessionMode(value: string | undefined): SessionMode {
-  if (value === "plan" || value === "build" || value === "auto") return value;
-  return "auto";
-}
-
-export function permissionForSession(mode: SessionMode, prompt?: string): PermissionMode {
-  if (mode === "plan") return "plan";
-  if (mode === "build") return "build";
-  if (!prompt) return "build";
-  const kind = inferRouteKind(prompt);
-  return kind === "explore" || kind === "compact" ? "plan" : "build";
+/** @deprecated use permissionForSessionMode — kept for tests / call sites */
+export function permissionForSession(mode: SessionMode, _prompt?: string): PermissionMode {
+  return permissionForSessionMode(mode);
 }
 
 export function resolveActiveModel(config: HarnesConfig, prompt?: string): {
@@ -76,7 +81,8 @@ export function resolveSession(
   const endpoint = resolveChatEndpoint(config);
   return {
     mode,
-    permissionMode: permissionForSession(mode, prompt),
+    permissionMode: permissionForSessionMode(mode),
+    modeLabel: SESSION_MODE_LABELS[mode],
     model,
     wireId: wireModelId(model, endpoint.provider),
     routing,
@@ -89,8 +95,7 @@ export function formatStatusLine(session: ActiveSession, extra?: { cwd?: string;
   const pin = session.routing === "pinned" ? "pinned" : "auto-route";
   const parts = [
     `model ${session.model.name}`,
-    `mode ${session.mode}`,
-    `tools ${session.permissionMode}`,
+    `mode ${session.modeLabel}`,
     `ctx ${formatTokenBar(session.tokensUsed, session.contextWindow)}`,
     pin,
   ];
@@ -104,7 +109,7 @@ export function formatFooterLines(session: ActiveSession, costUsd = 0): [string,
   const cost = costUsd > 0 ? `  ·  $${costUsd < 0.01 ? costUsd.toFixed(4) : costUsd.toFixed(2)} sess` : "";
   return [
     `→ ${session.model.name}  ${session.wireId}  ·  ctx ${formatTokenBar(session.tokensUsed, session.contextWindow)}${cost}`,
-    `» ${session.mode}/${session.permissionMode}  ·  ${route}  ·  /usage · /help`,
+    `» ${session.modeLabel}  ·  ${route}  ·  ⇧Tab cycle  ·  /usage · /help`,
   ];
 }
 

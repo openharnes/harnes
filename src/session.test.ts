@@ -6,17 +6,43 @@ import {
   formatFooterLines,
   formatFooterStatus,
   formatTokenBar,
+  normalizeSessionMode,
   permissionForSession,
   resolveActiveModel,
   resolveSession,
+  cycleSessionMode,
 } from "./session.ts";
+import { needsApproval } from "./exec/types.ts";
 
 describe("session", () => {
-  it("auto mode uses plan tools for explore prompts", () => {
-    assert.equal(permissionForSession("auto", "explain this repo"), "plan");
-    assert.equal(permissionForSession("auto", "add a retry policy"), "build");
-    assert.equal(permissionForSession("plan", "add a retry policy"), "plan");
-    assert.equal(permissionForSession("build", "explain this repo"), "build");
+  it("maps session modes onto tool surfaces", () => {
+    assert.equal(permissionForSession("plan"), "plan");
+    assert.equal(permissionForSession("auto"), "build");
+    assert.equal(permissionForSession("manual"), "build");
+    assert.equal(permissionForSession("ask"), "build");
+  });
+
+  it("normalizes legacy and alias mode names", () => {
+    assert.equal(normalizeSessionMode("build"), "auto");
+    assert.equal(normalizeSessionMode("automatic"), "auto");
+    assert.equal(normalizeSessionMode("ask-on-edit"), "ask");
+    assert.equal(normalizeSessionMode("nope"), "ask");
+  });
+
+  it("cycles Shift+Tab order: auto → manual → ask → plan", () => {
+    assert.equal(cycleSessionMode("auto"), "manual");
+    assert.equal(cycleSessionMode("manual"), "ask");
+    assert.equal(cycleSessionMode("ask"), "plan");
+    assert.equal(cycleSessionMode("plan"), "auto");
+  });
+
+  it("asks for approval only when the mode requires it", () => {
+    assert.equal(needsApproval("auto", "bash"), false);
+    assert.equal(needsApproval("manual", "read_file"), true);
+    assert.equal(needsApproval("ask", "read_file"), false);
+    assert.equal(needsApproval("ask", "write_file"), true);
+    assert.equal(needsApproval("ask", "bash"), true);
+    assert.equal(needsApproval("plan", "bash"), false);
   });
 
   it("pins a model when pinnedModelId is set", () => {
@@ -42,12 +68,12 @@ describe("session", () => {
     assert.equal(estimateTokens([{ role: "user", content: "abcd" }]), 1);
   });
 
-  it("formats the bottom status strip", () => {
+  it("formats the bottom status strip with mode label", () => {
     const session = resolveSession(DEFAULT_CONFIG, []);
-    const line = formatFooterStatus(session);
-    assert.match(line, /^→ /);
-    assert.match(line, / · /);
-    assert.match(line, /ctx /);
-    assert.match(line, /%/);
+    const [line1, line2] = formatFooterLines(session);
+    assert.match(line1, /^→ /);
+    assert.match(line2, /ask on edit|automatic|manual|plan/);
+    assert.match(line2, /⇧Tab/);
+    assert.match(formatFooterStatus(session), /ctx /);
   });
 });

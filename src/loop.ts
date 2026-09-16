@@ -70,6 +70,8 @@ export async function runAgentLoop(opts: {
   /** Prior conversation turns (without system). Used by the persistent REPL. */
   history?: ChatMessage[];
   onProgress?: (event: LoopProgress) => void;
+  /** Return false to deny a tool that needs interactive approval. */
+  onApprove?: (call: ToolCall) => Promise<boolean>;
 }): Promise<LoopResult> {
   const maxSteps = opts.maxSteps ?? 12;
   const prior = (opts.history ?? []).filter((message) => message.role !== "system");
@@ -103,6 +105,14 @@ export async function runAgentLoop(opts: {
           role: "tool",
           tool_call_id: call.id,
           content: `Tool ${call.name} is not available in ${opts.permissionMode} mode.`,
+        });
+        return { messages, steps: step + 1, stoppedReason: "denied-tool", usage };
+      }
+      if (opts.onApprove && !(await opts.onApprove(call))) {
+        messages.push({
+          role: "tool",
+          tool_call_id: call.id,
+          content: `User denied tool ${call.name}.`,
         });
         return { messages, steps: step + 1, stoppedReason: "denied-tool", usage };
       }
