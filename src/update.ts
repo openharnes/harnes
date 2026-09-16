@@ -19,7 +19,9 @@ interface CacheFile {
   checkedAt?: number;
 }
 
-function cachePath(): string {
+function cachePath(override?: string): string {
+  if (override) return override;
+  if (process.env.HARNES_UPDATE_CACHE) return process.env.HARNES_UPDATE_CACHE;
   return join(homedir(), ".cache", "harnes", "update.json");
 }
 
@@ -33,18 +35,18 @@ function compareSemver(a: string, b: string): number {
   return 0;
 }
 
-async function readCache(): Promise<CacheFile> {
+async function readCache(path: string): Promise<CacheFile> {
   try {
-    return JSON.parse(await readFile(cachePath(), "utf8")) as CacheFile;
+    return JSON.parse(await readFile(path, "utf8")) as CacheFile;
   } catch {
     return {};
   }
 }
 
-async function writeCache(latest: string, checkedAt: number): Promise<void> {
-  const file = cachePath();
-  await mkdir(join(homedir(), ".cache", "harnes"), { recursive: true });
-  await writeFile(file, `${JSON.stringify({ latest, checkedAt }, null, 2)}\n`, "utf8");
+async function writeCache(path: string, latest: string, checkedAt: number): Promise<void> {
+  const { dirname } = await import("node:path");
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `${JSON.stringify({ latest, checkedAt }, null, 2)}\n`, "utf8");
 }
 
 export async function fetchLatestVersion(fetchImpl: typeof fetch = fetch): Promise<string> {
@@ -62,26 +64,28 @@ export async function fetchLatestVersion(fetchImpl: typeof fetch = fetch): Promi
 /**
  * Check for a newer published version.
  * Uses a 24h cache unless `force` is set.
+ * Pass `cachePath` (or `HARNES_UPDATE_CACHE`) so tests never touch ~/.cache/harnes.
  */
 export async function checkForUpdate(
   current: string,
-  opts: { force?: boolean; fetchImpl?: typeof fetch } = {}
+  opts: { force?: boolean; fetchImpl?: typeof fetch; cachePath?: string } = {}
 ): Promise<UpdateCheck> {
   const now = Date.now();
-  const cache = await readCache();
+  const path = cachePath(opts.cachePath);
+  const cache = await readCache(path);
   let latest = cache.latest;
   let checkedAt = cache.checkedAt ?? 0;
 
   if (opts.force || !latest || now - checkedAt > CACHE_TTL_MS) {
     latest = await fetchLatestVersion(opts.fetchImpl);
     checkedAt = now;
-    await writeCache(latest, checkedAt);
+    await writeCache(path, latest, checkedAt);
   }
 
   return {
     current,
-    latest,
-    updateAvailable: compareSemver(latest, current) > 0,
+    latest: latest!,
+    updateAvailable: compareSemver(latest!, current) > 0,
     checkedAt,
   };
 }

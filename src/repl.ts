@@ -83,7 +83,7 @@ function startStatusLine(initial = "Running"): { update: (text: string) => void;
   };
 }
 
-const VERSION = "0.2.2";
+const VERSION = "0.2.3";
 const FOOTER_ROWS = 3; // full-width rule + status + bottom bar
 
 const SLASH_COMMANDS: Array<{ cmd: string; help: string }> = [
@@ -491,7 +491,8 @@ async function runSetup(config: HarnesConfig, opts: { nested: boolean }): Promis
 
 async function maybeHandleUpdateOnStart(config: HarnesConfig): Promise<HarnesConfig> {
   try {
-    const check = await checkForUpdate(VERSION);
+    // Always hit the registry when auto-update is on so a bad local cache can't invent versions.
+    const check = await checkForUpdate(VERSION, { force: Boolean(config.autoUpdate) });
     if (!check.updateAvailable) return config;
 
     if (config.autoUpdate) {
