@@ -79,7 +79,7 @@ harnes smoke
 | `/model` | show active model |
 | `/model auto` | hybrid route per prompt |
 | `/model <id>` | pin a catalog / OpenRouter slug |
-| `/mode auto\|manual\|ask\|plan` | approval mode (⇧Tab cycles) |
+| `/mode auto\|manual\|ask\|plan` | approval mode (⌃T / ⇧Tab; Warp: prefer ⌃T) |
 | `/usage` (`/cost`) | session spend + OpenRouter today / week / month |
 | `/update` | install latest from npm |
 | `/update auto on\|off` | opt-in auto-install on startup |

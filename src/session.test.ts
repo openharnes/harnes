@@ -73,7 +73,7 @@ describe("session", () => {
     const [line1, line2] = formatFooterLines(session);
     assert.match(line1, /^→ /);
     assert.match(line2, /ask on edit|automatic|manual|plan/);
-    assert.match(line2, /⇧Tab/);
+    assert.match(line2, /⌃T\/⇧Tab/);
     assert.match(formatFooterStatus(session), /ctx /);
   });
 });

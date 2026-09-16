@@ -104,12 +104,17 @@ export function formatStatusLine(session: ActiveSession, extra?: { cwd?: string;
 }
 
 /** Two-line footer under the input (WOZ-style). */
-export function formatFooterLines(session: ActiveSession, costUsd = 0): [string, string] {
+export function formatFooterLines(
+  session: ActiveSession,
+  costUsd = 0,
+  lastDone?: string
+): [string, string] {
   const route = session.routing === "pinned" ? "pinned" : "auto";
   const cost = costUsd > 0 ? `  ·  $${costUsd < 0.01 ? costUsd.toFixed(4) : costUsd.toFixed(2)} sess` : "";
+  const done = lastDone ? `  ·  ${lastDone}` : "";
   return [
-    `→ ${session.model.name}  ${session.wireId}  ·  ctx ${formatTokenBar(session.tokensUsed, session.contextWindow)}${cost}`,
-    `» ${session.modeLabel}  ·  ${route}  ·  ⇧Tab cycle  ·  /usage · /help`,
+    `→ ${session.model.name}  ${session.wireId}  ·  ctx ${formatTokenBar(session.tokensUsed, session.contextWindow)}${cost}${done}`,
+    `» ${session.modeLabel}  ·  ${route}  ·  ⌃T/⇧Tab cycle  ·  /usage · /help`,
   ];
 }
 

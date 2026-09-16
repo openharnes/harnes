@@ -82,7 +82,7 @@ function startStatusLine(initial = "Running"): { update: (text: string) => void;
   };
 }
 
-const VERSION = "0.2.0";
+const VERSION = "0.2.1";
 const FOOTER_ROWS = 3; // separator + 2 status lines
 
 const SLASH_COMMANDS: Array<{ cmd: string; help: string }> = [
@@ -92,7 +92,7 @@ const SLASH_COMMANDS: Array<{ cmd: string; help: string }> = [
   { cmd: "/model", help: "show / pin active model" },
   { cmd: "/model auto", help: "route per prompt" },
   { cmd: "/models", help: "list catalog" },
-  { cmd: "/mode", help: "auto | manual | ask | plan  (⇧Tab)" },
+  { cmd: "/mode", help: "auto | manual | ask | plan  (⌃T / ⇧Tab)" },
   { cmd: "/usage", help: "session + OpenRouter spend" },
   { cmd: "/cost", help: "alias for /usage" },
   { cmd: "/update", help: "check / install latest from npm" },
@@ -139,7 +139,13 @@ function promptPrefix(): string {
   return `${ansi.inputBg}${ansi.inputFg}${ansi.bold} › ${ansi.reset}${ansi.inputBg}${ansi.inputFg}`;
 }
 
-type TtyKey = { name?: string; shift?: boolean; ctrl?: boolean; meta?: boolean };
+type TtyKey = {
+  name?: string;
+  shift?: boolean;
+  ctrl?: boolean;
+  meta?: boolean;
+  sequence?: string;
+};
 
 type RlWithTty = readline.Interface & {
   _ttyWrite?: (s: string | undefined, key: TtyKey) => void;
@@ -147,12 +153,24 @@ type RlWithTty = readline.Interface & {
   cursor?: number;
 };
 
+/** Warp often remaps Shift+Tab → Ctrl+Y; also accept Ctrl+T as a reliable cycle key. */
+function isModeCycleKey(key: TtyKey | undefined): boolean {
+  if (!key) return false;
+  if (key.name === "tab" && key.shift) return true;
+  if (key.sequence === "\x1b[Z") return true;
+  if (key.ctrl && (key.name === "y" || key.name === "t")) return true;
+  return false;
+}
+
 export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
   let config = initialConfig;
   const cwd = process.cwd();
   const backend = new LocalBackend(cwd);
   const history: ChatMessage[] = [];
   const usage: SessionUsage = emptySessionUsage();
+  let lastDone = "";
+  let turnBusy = false;
+  let painting = false;
 
   if (!process.stdin.isTTY) {
     console.error("Persistent session needs a TTY. Use `harnes run \"...\"` for one-shot.");
@@ -192,24 +210,40 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
     completer: slashCompleter,
   }) as RlWithTty;
 
-  const showIdle = () => {
+  const footerBlock = (): string => {
     const session = resolveSession(config, history);
     const width = Math.min(process.stdout.columns || 80, 88);
-    const [line1, line2] = formatFooterLines(session, usage.costUsd);
-    const plainPrompt = " › ";
-    const lineLen = (rl.line ?? "").length;
+    const [line1, line2] = formatFooterLines(session, usage.costUsd, lastDone || undefined);
+    return (
+      `${paint(ansi.dim, "─".repeat(width))}\n` +
+      `${paint(ansi.soft, line1)}\n` +
+      `${paint(ansi.warm, line2)}`
+    );
+  };
+
+  /** Keep the status strip under the input while typing (readline otherwise wipes it). */
+  const paintFooterUnderInput = () => {
+    if (turnBusy || painting) return;
+    painting = true;
+    try {
+      const plainPrompt = " › ";
+      const cursor = rl.cursor ?? (rl.line ?? "").length;
+      const col = plainPrompt.length + 1 + cursor;
+      output.write(`\n\x1b[0J${footerBlock()}\x1b[${FOOTER_ROWS}A\x1b[${col}G`);
+    } finally {
+      painting = false;
+    }
+  };
+
+  const showIdle = () => {
+    turnBusy = false;
+    const line = rl.line ?? "";
     rl.setPrompt(promptPrefix());
     output.write(ansi.reset);
     output.write("\r\x1b[0K");
     rl.prompt();
-    if (rl.line) output.write(rl.line);
-    output.write(
-      `\n${paint(ansi.dim, "─".repeat(width))}\n` +
-        `${paint(ansi.soft, line1)}\n` +
-        `${paint(ansi.warm, line2)}`
-    );
-    // Return to the input line; caret after prompt + typed text.
-    output.write(`\x1b[${FOOTER_ROWS}A\x1b[${plainPrompt.length + 1 + lineLen}G`);
+    if (line) output.write(line);
+    paintFooterUnderInput();
   };
 
   const clearBelowInput = () => {
@@ -224,27 +258,28 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
       permissionMode: permissionForSessionMode(nextMode),
     };
     await saveConfig(config);
-    // Redraw footer in place without dumping completer noise.
-    output.write("\x1b[0J");
-    showIdle();
-    // Toast on the status line briefly via stderr-adjacent write above footer
-    output.write(`\x1b[s\x1b[${FOOTER_ROWS}B\r\x1b[2K${paint(ansi.soft, `mode → ${SESSION_MODE_LABELS[nextMode]}`)}\x1b[u`);
+    paintFooterUnderInput();
   };
 
-  // Shift+Tab must NOT run readline reverse-tab completion (that stacked the / menu).
   const originalTtyWrite = rl._ttyWrite?.bind(rl);
   if (originalTtyWrite) {
     rl._ttyWrite = (s, key) => {
-      if (key?.name === "tab" && key.shift) {
+      if (isModeCycleKey(key)) {
         void cycleModeFromKey();
         return;
       }
-      return originalTtyWrite(s, key);
+      originalTtyWrite(s, key);
+      // Re-anchor footer after every edit so it stays visible while typing.
+      if (!turnBusy && key?.name !== "return" && key?.name !== "enter") {
+        paintFooterUnderInput();
+      }
     };
   }
 
   const shutdown = async () => {
+    turnBusy = true;
     output.write(ansi.reset);
+    clearBelowInput();
     rl.close();
     await backend.close();
     await printUsage(usage, config, history);
@@ -290,9 +325,11 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
     }
 
     try {
-      await runTurn(text, config, backend, history, usage, rl);
+      turnBusy = true;
+      lastDone = await runTurn(text, config, backend, history, usage, rl);
     } catch (error) {
       console.error(error instanceof Error ? error.message : error);
+      lastDone = "error";
     }
     showIdle();
   }
@@ -339,7 +376,7 @@ function printWelcomeBox(
     paint(ansi.accentBright, "Tips for getting started"),
     paint(ansi.cmd, "/help") + paint(ansi.muted, "  see all commands"),
     paint(ansi.cmd, "/model") + paint(ansi.muted, " pin Qwen / Claude / GPT"),
-    paint(ansi.cmd, "/mode") + paint(ansi.muted, "  ⇧Tab cycle approvals"),
+    paint(ansi.cmd, "/mode") + paint(ansi.muted, "  ⌃T / ⇧Tab cycle modes"),
     "",
     paint(ansi.accentBright, "Recent activity"),
     history.length === 0
@@ -359,7 +396,7 @@ function printWelcomeBox(
   console.log(bot);
   console.log(paint(ansi.muted, ONE_LINER));
   console.log(
-    paint(ansi.dim, "Type a task, or / for commands  ·  Tab autocomplete  ·  ⇧Tab cycle mode")
+    paint(ansi.dim, "Type a task, or / for commands  ·  Tab autocomplete  ·  ⌃T cycle mode (⇧Tab in iTerm)")
   );
   console.log("");
 }
@@ -370,7 +407,8 @@ function printSlashMenu(): void {
     console.log(`  ${paint(ansi.cmd, cmd.padEnd(18))} ${paint(ansi.muted, help)}`);
   }
   console.log("");
-  console.log(paint(ansi.muted, "Modes (⇧Tab): automatic → manual → ask on edit → plan"));
+  console.log(paint(ansi.muted, "Modes (⌃T or ⇧Tab): automatic → manual → ask on edit → plan"));
+  console.log(paint(ansi.muted, "Warp tip: Shift+Tab is often broken — use Ctrl+T to cycle."));
 }
 
 function printWelcome(cwd: string): void {
@@ -524,7 +562,7 @@ async function handleSlash(
       }
       const aliases = new Set(["auto", "automatic", "manual", "ask", "ask-on-edit", "plan", "build"]);
       if (!aliases.has(arg.toLowerCase())) {
-        console.log("Usage: /mode auto|manual|ask|plan   (or ⇧Tab)");
+        console.log("Usage: /mode auto|manual|ask|plan   (or ⌃T / ⇧Tab)");
         return "ok";
       }
       const sessionMode = normalizeSessionMode(arg);
@@ -668,10 +706,10 @@ async function runTurn(
   history: ChatMessage[],
   usage: SessionUsage,
   rl: readline.Interface
-): Promise<void> {
+): Promise<string> {
   if (!hasUsableApiKey(config) && config.provider !== "ollama") {
     console.log("No API key configured. Run /setup first.");
-    return;
+    return "no key";
   }
 
   const started = Date.now();
@@ -720,14 +758,16 @@ async function runTurn(
       endpoint.provider === "openrouter" || turnCost > 0
         ? ` · ${formatUsd(turnCost)} this turn · ${formatUsd(usage.costUsd)} session`
         : "";
-    status.stop(
-      `✓ Done · ${elapsedSec}s · ${result.steps} step${result.steps === 1 ? "" : "s"} · ${result.stoppedReason}${costPart}`
-    );
+    const summary = `✓ Done · ${elapsedSec}s · ${result.steps} step${result.steps === 1 ? "" : "s"} · ${result.stoppedReason}${costPart}`;
+    status.stop(summary);
 
     const last = [...result.messages].reverse().find((message) => message.role === "assistant" && message.content);
     console.log("");
     if (last?.content) console.log(last.content);
     else console.log(paint(ansi.muted, `(${result.stoppedReason} after ${result.steps} steps)`));
+
+    // Compact sticky form for the always-on footer
+    return `✓ ${elapsedSec}s/${result.steps} · ${formatUsd(turnCost)}`;
   } catch (error) {
     status.stop();
     throw error;
