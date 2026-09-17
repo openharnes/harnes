@@ -51,8 +51,27 @@ export interface LoopResult {
 
 export type LoopProgress =
   | { type: "thinking"; step: number }
-  | { type: "tool"; step: number; name: string }
+  /** Model narration mid-turn (usually paired with upcoming tool calls). */
+  | { type: "assistant"; step: number; content: string }
+  | {
+      type: "tool";
+      step: number;
+      name: string;
+      arguments: Record<string, string>;
+      /** start = about to run; end = finished (see ok/preview). */
+      phase: "start" | "end";
+      ok?: boolean;
+      /** One-line result preview for the REPL trail (end phase). */
+      preview?: string;
+    }
   | { type: "subagent"; step: number; task: string };
+
+/** Compact a tool result for live progress lines (single line, capped). */
+export function previewToolResult(result: string, max = 96): string {
+  const one = result.replace(/\s+/g, " ").trim();
+  if (!one) return "";
+  return one.length > max ? `${one.slice(0, max - 1)}…` : one;
+}
 
 /**
  * Tools that must not run concurrently with siblings in the same step.
@@ -391,6 +410,12 @@ export async function runAgentLoop(opts: {
       ...(reply.toolCalls.length > 0 ? { tool_calls: reply.toolCalls } : {}),
     });
 
+    // Surface mid-turn narration so the user sees intent while tools run —
+    // not only the final answer after a long silent wait.
+    if (reply.content.trim() && reply.toolCalls.length > 0) {
+      opts.onProgress?.({ type: "assistant", step: step + 1, content: reply.content });
+    }
+
     if (reply.toolCalls.length === 0) {
       // Weak models often narrate "Let me check…" / ask for "ok" and stop with
       // zero tool calls. Nudge them and force tool_choice=required so the next
@@ -443,8 +468,14 @@ export async function runAgentLoop(opts: {
     const results = await runWithConcurrencyLimit(
       runnable.map((entry) => async () => {
         if (opts.signal?.aborted) return "Tool error: aborted.";
-        opts.onProgress?.({ type: "tool", step: step + 1, name: entry.call.name });
-        return await executeTool(
+        opts.onProgress?.({
+          type: "tool",
+          step: step + 1,
+          name: entry.call.name,
+          arguments: entry.call.arguments,
+          phase: "start",
+        });
+        const result = await executeTool(
           opts.backend,
           entry.call,
           todos,
@@ -463,6 +494,20 @@ export async function runAgentLoop(opts: {
           },
           opts.mcp
         );
+        const failed =
+          /^Tool error:/i.test(result) ||
+          /^User denied\b/i.test(result) ||
+          (/^Tool /i.test(result) && /\bis not available\b/i.test(result));
+        opts.onProgress?.({
+          type: "tool",
+          step: step + 1,
+          name: entry.call.name,
+          arguments: entry.call.arguments,
+          phase: "end",
+          ok: !failed,
+          preview: previewToolResult(result),
+        });
+        return result;
       }),
       concurrency
     );

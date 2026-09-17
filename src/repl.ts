@@ -2,6 +2,7 @@ import * as os from "node:os";
 import * as readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import {
+  configFromEnv,
   hasUsableApiKey,
   resolveChatEndpoint,
   saveConfig,
@@ -34,6 +35,7 @@ import {
   OPENROUTER_BASE_URL,
   OLLAMA_BASE_URL,
   normalizeModelId,
+  type ModelSpec,
 } from "./models/catalog.ts";
 import { ONE_LINER, PRODUCT_NAME, SHORT_NAME } from "./positioning.ts";
 import { fetchOpenRouterKeyUsage, formatUsd } from "./openrouter/usage.ts";
@@ -47,6 +49,7 @@ import {
   type SessionUsage,
 } from "./session.ts";
 import { applyUpdate, checkForUpdate, NPM_PACKAGE } from "./update.ts";
+import { selectFromList, type SelectItem } from "./ui/select.ts";
 import { HARNES_VERSION } from "./version.ts";
 
 export type { SessionUsage };
@@ -63,22 +66,40 @@ function emptySessionUsage(): SessionUsage {
 }
 
 /** Animated status line that rewrites in place so long turns don't look stuck. */
-function startStatusLine(initial = "Running"): { update: (text: string) => void; stop: (final?: string) => void } {
+function startStatusLine(initial = "Running"): {
+  update: (text: string) => void;
+  /** Print a durable trail line above the spinner (tools / narration). */
+  note: (line: string) => void;
+  stop: (final?: string) => void;
+} {
   const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+  const started = Date.now();
   let i = 0;
   let label = initial;
   let stopped = false;
-  const tick = () => {
+  const render = () => {
     if (stopped) return;
     const frame = frames[i % frames.length];
     i += 1;
-    output.write(`\r${paint(ansi.warm, `${frame} ${label}…`)}${" ".repeat(12)}`);
+    const elapsed = Math.max(0, Math.floor((Date.now() - started) / 1000));
+    const text = `${frame} ${label} · ${elapsed}s`;
+    // Pad then clear to EOL so shorter labels don't leave leftovers.
+    output.write(`\r${paint(ansi.warm, text)}\x1b[K`);
   };
-  tick();
-  const id = setInterval(tick, 80);
+  render();
+  const id = setInterval(render, 80);
   return {
     update(text: string) {
       label = text;
+    },
+    note(line: string) {
+      if (stopped) {
+        console.log(line);
+        return;
+      }
+      output.write(`\r\x1b[2K`);
+      console.log(line);
+      render();
     },
     stop(final?: string) {
       if (stopped) return;
@@ -100,8 +121,8 @@ const SLASH_COMMANDS: Array<{ cmd: string; help: string }> = [
   { cmd: "/todos", help: "show the current task list" },
   { cmd: "/mcp", help: "list configured MCP servers/tools/status" },
   { cmd: "/skills", help: "list available skill files" },
-  { cmd: "/model", help: "show / pin active model (/model auto to un-pin)" },
-  { cmd: "/models", help: "list catalog" },
+  { cmd: "/model", help: "pick a model (↑↓/click · Enter) · /model <id> · /model auto" },
+  { cmd: "/models", help: "same as /model — interactive catalog picker" },
   { cmd: "/mode", help: "auto | manual | ask | plan  (labels: automatic / ask on edit)  ⌃T / ⇧Tab" },
   { cmd: "/usage", help: "session + OpenRouter spend" },
   { cmd: "/cost", help: "alias for /usage" },
@@ -200,8 +221,23 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
     return;
   }
 
-  const firstRun = !config.setupComplete || !hasUsableApiKey(config);
-  if (firstRun) {
+  const envKey = openRouterKeyFromEnv();
+  // Env already has a usable OpenRouter key → skip the interactive wizard entirely.
+  const firstRunNeedsWizard = !config.setupComplete || !hasUsableApiKey(config);
+  if (firstRunNeedsWizard && envKey && !config.setupComplete) {
+    const saved: HarnesConfig = {
+      ...config,
+      setupComplete: true,
+      provider: "openrouter",
+      openaiCompatible: { baseUrl: OPENROUTER_BASE_URL },
+      sessionMode: config.sessionMode || "ask",
+      permissionMode: permissionForSessionMode(config.sessionMode || "ask"),
+    };
+    await saveConfig(saved);
+    config = configFromEnv(saved);
+    console.log(paint(ansi.soft, "Using OPENROUTER_API_KEY from the environment."));
+    console.log("");
+  } else if (firstRunNeedsWizard) {
     printWelcomeBox(config, cwd, history, { firstRun: true });
     config = await runSetup(config, { nested: false });
   }
@@ -458,7 +494,7 @@ function printWelcomeBox(
   const right: string[] = [
     paint(ansi.accentBright, "Tips for getting started"),
     paint(ansi.cmd, "/help") + paint(ansi.muted, "  see all commands"),
-    paint(ansi.cmd, "/model") + paint(ansi.muted, " pin Qwen / Claude / GPT"),
+    paint(ansi.cmd, "/model") + paint(ansi.muted, " pick Qwen / Claude / GPT"),
     paint(ansi.cmd, "/mode") + paint(ansi.muted, "  ⌃T / ⇧Tab cycle modes"),
     "",
     paint(ansi.accentBright, "This session"),
@@ -509,6 +545,11 @@ function printWelcome(cwd: string): void {
   console.log("");
 }
 
+function openRouterKeyFromEnv(): string {
+  const key = (process.env.OPENROUTER_API_KEY ?? process.env.HARNES_OPENROUTER_API_KEY ?? "").trim();
+  return key.startsWith("sk-or-") ? key : "";
+}
+
 async function runSetup(
   config: HarnesConfig,
   opts: { nested: boolean; rl?: readline.Interface }
@@ -516,6 +557,13 @@ async function runSetup(
   const ownsRl = !opts.rl;
   const rl = opts.rl ?? readline.createInterface({ input, output, terminal: true });
   if (!opts.nested) printWelcome(process.cwd());
+
+  const envKey = openRouterKeyFromEnv();
+  if (envKey) {
+    console.log(paint(ansi.soft, "OPENROUTER_API_KEY detected in the environment — will use it for OpenRouter."));
+    console.log("");
+  }
+
   console.log("How should Harnes talk to models?");
   console.log("  1) OpenRouter  (cloud, recommended — one key, many models)");
   console.log("  2) Ollama      (local, no cloud key)");
@@ -533,15 +581,24 @@ async function runSetup(
     console.log("Using Ollama at http://127.0.0.1:11434/v1");
   } else if (choice === "3") {
     console.log("Skipped. Run /setup when you have a key.");
+  } else if (envKey) {
+    // Env already has a usable key — never re-prompt, and don't copy the secret into config.json.
+    next = {
+      ...next,
+      provider: "openrouter",
+      openaiCompatible: { baseUrl: OPENROUTER_BASE_URL },
+    };
+    console.log("OpenRouter ready (using OPENROUTER_API_KEY from the environment).");
   } else {
-    const existing = process.env.OPENROUTER_API_KEY ?? config.openaiCompatible?.apiKey ?? "";
-    const keepHint = existing.startsWith("sk-or-")
+    const stored = (config.openaiCompatible?.apiKey ?? "").trim();
+    const keepable = stored.startsWith("sk-or-") ? stored : "";
+    const keepHint = keepable
       ? "OpenRouter API key (Enter to keep): "
       : "OpenRouter API key (sk-or-...): ";
     const entered = (await rl.question(keepHint)).trim();
-    const key = entered || (existing.startsWith("sk-or-") ? existing : "");
+    const key = entered || keepable;
     if (!key) {
-      console.log("No key stored. Run /setup later.");
+      console.log("No key stored. Set OPENROUTER_API_KEY or run /setup later.");
     } else {
       next = {
         ...next,
@@ -563,7 +620,19 @@ async function runSetup(
   };
 
   if (ownsRl) rl.close();
-  await saveConfig(next);
+  // Never persist an API key that already lives in the environment.
+  const toSave =
+    envKey && next.openaiCompatible?.apiKey === envKey
+      ? {
+          ...next,
+          openaiCompatible: {
+            baseUrl: next.openaiCompatible?.baseUrl ?? OPENROUTER_BASE_URL,
+          },
+        }
+      : next;
+  await saveConfig(toSave);
+  // Re-apply env so the in-memory session sees OPENROUTER_API_KEY without storing it on disk.
+  next = configFromEnv(toSave);
   console.log("");
   return next;
 }
@@ -649,9 +718,13 @@ async function handleSlash(
       return "ok";
     }
     case "models":
-      await listModels(ctx.getConfig());
+      await pickModelInteractive(ctx);
       return "ok";
     case "model":
+      if (!arg) {
+        await pickModelInteractive(ctx);
+        return "ok";
+      }
       await setModel(ctx, arg);
       return "ok";
     case "usage":
@@ -802,25 +875,90 @@ async function printMcpStatus(mcp: McpManager): Promise<void> {
   }
 }
 
-async function listModels(config: HarnesConfig): Promise<void> {
-  const session = resolveSession(config, []);
+type ModelPick = { kind: "auto" } | { kind: "model"; model: ModelSpec };
+
+async function loadSelectableModels(config: HarnesConfig): Promise<ModelSpec[]> {
   const endpoint = resolveChatEndpoint(config);
-  let models = MODEL_CATALOG;
   if (endpoint.provider === "openrouter") {
     try {
-      models = await listOpenRouterModels({ apiKey: endpoint.apiKey });
+      return await listOpenRouterModels({ apiKey: endpoint.apiKey });
     } catch {
-      models = MODEL_CATALOG;
+      return MODEL_CATALOG;
     }
   }
-  console.log(`${"tier".padEnd(14)} ${"id".padEnd(40)} ctx`);
-  for (const model of models.slice(0, 40)) {
-    const mark = model.id === session.model.id || model.openrouterModel === session.wireId ? "*" : " ";
-    const id = (model.openrouterModel ?? model.id).slice(0, 40);
-    console.log(`${model.tier.padEnd(14)} ${id.padEnd(40)} ${String(model.minContext).padStart(8)} ${mark}`);
+  return MODEL_CATALOG;
+}
+
+async function pickModelInteractive(ctx: {
+  getConfig: () => HarnesConfig;
+  setConfig: (config: HarnesConfig) => Promise<void>;
+  history: ChatMessage[];
+  rl: readline.Interface;
+}): Promise<void> {
+  const config = ctx.getConfig();
+  const session = resolveSession(config, ctx.history);
+  const endpoint = resolveChatEndpoint(config);
+  const models = await loadSelectableModels(config);
+
+  const items: SelectItem<ModelPick>[] = [
+    {
+      value: { kind: "auto" },
+      label: "auto (route by task)",
+      detail: `→ ${session.routing === "pinned" ? "currently pinned" : session.model.name}`,
+      current: session.routing !== "pinned",
+    },
+    ...models.map((model) => {
+      const wire = model.openrouterModel ?? model.id;
+      const current =
+        session.routing === "pinned" &&
+        (model.id === session.model.id || model.openrouterModel === session.wireId || wire === session.wireId);
+      const ctxK = model.minContext >= 1000 ? `${Math.round(model.minContext / 1000)}k` : String(model.minContext);
+      return {
+        value: { kind: "model" as const, model },
+        label: model.name,
+        detail: `${model.tier} · ${ctxK} · ${wire}`,
+        current,
+      };
+    }),
+  ];
+
+  const initialIndex = Math.max(
+    0,
+    items.findIndex((item) => item.current)
+  );
+
+  // Pause readline so the picker owns raw stdin (keys + mouse).
+  ctx.rl.pause();
+  let choice: ModelPick | null = null;
+  try {
+    choice = await selectFromList<ModelPick>({
+      title: "Select model",
+      items,
+      initialIndex,
+      pageSize: Math.min(14, Math.max(8, (process.stdout.rows || 24) - 10)),
+      paint,
+      colors: {
+        accent: ansi.accent,
+        accentBright: ansi.accentBright,
+        muted: ansi.muted,
+        soft: ansi.soft,
+        warm: ansi.warm,
+      },
+    });
+  } finally {
+    ctx.rl.resume();
   }
-  if (models.length > 40) console.log(`… ${models.length - 40} more (pin with /model <id>)`);
-  console.log("Pin with /model <id>   ·   /model auto");
+
+  if (!choice) {
+    console.log(paint(ansi.muted, "Model picker cancelled."));
+    return;
+  }
+  if (choice.kind === "auto") {
+    await setModel(ctx, "auto");
+    return;
+  }
+  const pinId = endpoint.provider === "openrouter" ? (choice.model.openrouterModel ?? choice.model.id) : choice.model.id;
+  await setModel(ctx, pinId);
 }
 
 async function setModel(
@@ -831,15 +969,6 @@ async function setModel(
   },
   arg: string
 ): Promise<void> {
-  if (!arg) {
-    const session = resolveSession(ctx.getConfig(), ctx.history);
-    console.log(
-      session.routing === "pinned"
-        ? `pinned ${session.model.id} (${session.model.name}) · ctx ${session.contextWindow.toLocaleString()}`
-        : `auto-route → ${session.model.id} (${session.model.name})`
-    );
-    return;
-  }
   if (arg === "auto") {
     const next = { ...ctx.getConfig() };
     delete next.pinnedModelId;
@@ -865,7 +994,7 @@ async function setModel(
   }
 }
 
-function summarizeTool(call: ToolCall): string {
+function summarizeTool(call: { name: string; arguments: Record<string, string> }): string {
   if (call.name === "write_file") return `write_file ${call.arguments.path ?? ""}`;
   if (call.name === "bash") {
     const cmd = call.arguments.command ?? "";
@@ -901,6 +1030,17 @@ function summarizeTool(call: ToolCall): string {
   }
   if (call.name.startsWith(MCP_TOOL_PREFIX)) return call.name;
   return `${call.name} ${JSON.stringify(call.arguments).slice(0, 60)}`;
+}
+
+/** First meaningful line of mid-turn assistant narration for the live trail. */
+function summarizeAssistantNarration(content: string, max = 120): string {
+  const line =
+    content
+      .split(/\r?\n/)
+      .map((part) => part.trim())
+      .find((part) => part.length > 0) ?? "";
+  if (!line) return "";
+  return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 }
 
 async function runTurn(
@@ -940,9 +1080,32 @@ async function runTurn(
       signal,
       complete: (input) => openaiCompatibleComplete(endpoint.baseUrl, endpoint.apiKey, input),
       onProgress: (event: LoopProgress) => {
-        if (event.type === "thinking") status.update(`Thinking · step ${event.step}`);
-        else if (event.type === "subagent") status.update(`subagent: ${event.task}`);
-        else status.update(`${event.name} · step ${event.step}`);
+        if (event.type === "thinking") {
+          status.update(`Thinking · step ${event.step}`);
+          return;
+        }
+        if (event.type === "assistant") {
+          const line = summarizeAssistantNarration(event.content);
+          if (line) status.note(paint(ansi.muted, `  ${line}`));
+          status.update(`Working · step ${event.step}`);
+          return;
+        }
+        if (event.type === "subagent") {
+          status.note(paint(ansi.muted, `↳ subagent: ${event.task}`));
+          status.update(`subagent · step ${event.step}`);
+          return;
+        }
+        // tool
+        if (event.phase === "start") {
+          status.note(paint(ansi.accentBright, `→ ${summarizeTool(event)}`));
+          status.update(`${event.name} · step ${event.step}`);
+          return;
+        }
+        const mark = event.ok === false ? "✗" : "✓";
+        const color = event.ok === false ? ansi.warm : ansi.muted;
+        const preview = event.preview ? ` · ${event.preview}` : "";
+        status.note(paint(color, `  ${mark} ${event.name}${preview}`));
+        status.update(`Thinking · step ${event.step}`);
       },
       onApprove: async (call) => {
         if (signal?.aborted) return false;

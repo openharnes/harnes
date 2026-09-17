@@ -510,7 +510,7 @@ describe("parallel tool execution", () => {
       backend,
       permissionMode: "build",
       onProgress: (event) => {
-        if (event.type === "tool") progressed.push(event.name);
+        if (event.type === "tool" && event.phase === "start") progressed.push(event.name);
       },
       complete: async () => {
         step += 1;
@@ -528,6 +528,37 @@ describe("parallel tool execution", () => {
     });
     assert.equal(progressed.length, 2);
     assert.deepEqual(progressed, ["bash", "bash"]);
+  });
+
+  it("emits assistant narration and tool start/end progress for the live trail", async () => {
+    const backend = memoryBackend();
+    const events: import("./loop.ts").LoopProgress[] = [];
+    let step = 0;
+    await runAgentLoop({
+      prompt: "run then finish",
+      model,
+      backend,
+      permissionMode: "build",
+      onProgress: (event) => events.push(event),
+      complete: async () => {
+        step += 1;
+        if (step === 1) {
+          return {
+            content: "Checking the file now.",
+            toolCalls: [{ id: "1", name: "bash", arguments: { command: "echo hi" } }],
+          };
+        }
+        return { content: "done", toolCalls: [] };
+      },
+    });
+    assert.ok(events.some((e) => e.type === "assistant" && e.content.includes("Checking")));
+    const starts = events.filter((e) => e.type === "tool" && e.phase === "start");
+    const ends = events.filter((e) => e.type === "tool" && e.phase === "end");
+    assert.equal(starts.length, 1);
+    assert.equal(ends.length, 1);
+    assert.equal(starts[0]?.type === "tool" && starts[0].arguments.command, "echo hi");
+    assert.equal(ends[0]?.type === "tool" && ends[0].ok, true);
+    assert.ok(ends[0]?.type === "tool" && (ends[0].preview?.length ?? 0) > 0);
   });
 
   it("a denied call fails only itself and does not cancel an already-kicked-off sibling", async () => {
