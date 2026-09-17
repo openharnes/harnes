@@ -18,6 +18,7 @@ import {
 import {
   openaiCompatibleComplete,
   runAgentLoop,
+  shouldAutoContinue,
   type ChatMessage,
   type LoopProgress,
   type ToolCall,
@@ -87,7 +88,7 @@ function startStatusLine(initial = "Running"): { update: (text: string) => void;
   };
 }
 
-const VERSION = "0.3.1";
+const VERSION = "0.3.2";
 const FOOTER_ROWS = 3; // full-width rule + status + bottom bar
 
 const SLASH_COMMANDS: Array<{ cmd: string; help: string }> = [
@@ -858,9 +859,18 @@ async function runTurn(
     const summary = `✓ Done · ${elapsedSec}s · ${result.steps} step${result.steps === 1 ? "" : "s"} · ${result.stoppedReason}${costPart}`;
     status.stop(summary);
 
-    const last = [...result.messages].reverse().find((message) => message.role === "assistant" && message.content);
+    const assistants = result.messages.filter((message) => message.role === "assistant" && message.content.trim());
+    const lastUseful = [...assistants].reverse().find((message) => !shouldAutoContinue(message.content));
+    const last = lastUseful ?? assistants.at(-1);
     console.log("");
-    if (last?.content) console.log(last.content);
+    if (last && shouldAutoContinue(last.content) && !lastUseful) {
+      console.log(
+        paint(
+          ansi.muted,
+          "(Model stalled mid-task instead of finishing. Say what you want next, or try /model with a stronger model.)"
+        )
+      );
+    } else if (last?.content) console.log(last.content);
     else console.log(paint(ansi.muted, `(${result.stoppedReason} after ${result.steps} steps)`));
 
     // Compact sticky form for the always-on footer

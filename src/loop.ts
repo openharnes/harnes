@@ -29,6 +29,8 @@ export interface CompletionClient {
     model: string;
     messages: ChatMessage[];
     tools: { name: string; description: string }[];
+    /** When "required", the model must emit at least one tool call (OpenAI/OpenRouter). */
+    toolChoice?: "auto" | "required" | "none";
   }): Promise<CompletionResult>;
 }
 
@@ -231,6 +233,7 @@ export async function runAgentLoop(opts: {
   const mcpTools = opts.mcp ? await opts.mcp.listTools() : [];
   const tools = mcpTools.length > 0 ? [...TOOLS, ...mcpTools] : TOOLS;
   let autoContinues = 0;
+  let forceTools = false;
 
   for (let step = 0; step < maxSteps; step += 1) {
     opts.onProgress?.({ type: "thinking", step: step + 1 });
@@ -238,16 +241,19 @@ export async function runAgentLoop(opts: {
       model: opts.model.providerModel,
       messages,
       tools,
+      toolChoice: forceTools ? "required" : "auto",
     });
+    forceTools = false;
     addUsage(usage, reply.usage);
     messages.push({ role: "assistant", content: reply.content });
 
     if (reply.toolCalls.length === 0) {
       // Weak models often narrate "Let me check…" / ask for "ok" and stop with
-      // zero tool calls. Nudge them to keep acting instead of making the user
-      // type "ok" after every micro-step.
+      // zero tool calls. Nudge them and force tool_choice=required so the next
+      // completion cannot be text-only.
       if (autoContinues < MAX_AUTO_CONTINUES && shouldAutoContinue(reply.content)) {
         autoContinues += 1;
+        forceTools = true;
         opts.onProgress?.({ type: "thinking", step: step + 1 });
         messages.push({ role: "user", content: CONTINUE_NUDGE });
         continue;
@@ -366,10 +372,10 @@ function systemPrompt(mode: PermissionMode, exec: string): string {
 }
 
 /** Max times we inject a continue nudge when the model stalls with no tool calls. */
-const MAX_AUTO_CONTINUES = 3;
+const MAX_AUTO_CONTINUES = 8;
 
 const CONTINUE_NUDGE =
-  'Continue the task now. Call the needed tools in this response — do not ask me to confirm or wait for another "ok". Only stop when the request is fully handled or you need a real decision only I can make.';
+  'Stop narrating. Emit the tool call(s) for the next concrete action NOW (list_dir / read_file / bash / etc). Do not write another "Let me…" / "I\'ll check…" sentence and do not ask for ok/sure/confirmation. Keep going until the user\'s request is fully done.';
 
 /**
  * Detects "Let me check…" / "Should I…?" stalls where the model narrates
@@ -642,6 +648,7 @@ export async function openaiCompatibleComplete(
         type: "function",
         function: { name: tool.name, description: tool.description, parameters: { type: "object", additionalProperties: true } },
       })),
+      ...(input.toolChoice ? { tool_choice: input.toolChoice } : {}),
       // OpenRouter returns usage.cost when this is set / by default for non-streaming.
       usage: { include: true },
     }),

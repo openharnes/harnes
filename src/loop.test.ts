@@ -60,7 +60,34 @@ describe("agent loop auto-continue", () => {
     assert.ok(calls >= 2);
     assert.equal(result.stoppedReason, "complete");
     assert.ok(result.messages.some((m) => m.role === "tool" && m.content.includes("<h1>hi</h1>")));
-    assert.ok(result.messages.some((m) => m.role === "user" && /Continue the task now/i.test(m.content)));
+    assert.ok(result.messages.some((m) => m.role === "user" && /Stop narrating|Emit the tool call/i.test(m.content)));
+  });
+
+  it("requests tool_choice=required on the follow-up after a stall", async () => {
+    const backend = memoryBackend();
+    backend.files.set("a.txt", "hi");
+    const choices: Array<string | undefined> = [];
+    let calls = 0;
+    await runAgentLoop({
+      prompt: "read a.txt",
+      model,
+      backend,
+      permissionMode: "build",
+      complete: async (input) => {
+        choices.push(input.toolChoice);
+        calls += 1;
+        if (calls === 1) return { content: "Let me read a.txt.", toolCalls: [] };
+        if (calls === 2) {
+          return {
+            content: "",
+            toolCalls: [{ id: "1", name: "read_file", arguments: { path: "a.txt" } }],
+          };
+        }
+        return { content: "Done.", toolCalls: [] };
+      },
+    });
+    assert.equal(choices[0], "auto");
+    assert.equal(choices[1], "required");
   });
 });
 
