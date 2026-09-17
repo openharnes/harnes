@@ -1,4 +1,6 @@
 import * as os from "node:os";
+import { existsSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
 import * as readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import {
@@ -34,39 +36,51 @@ import {
   MODEL_CATALOG,
   OPENROUTER_BASE_URL,
   OLLAMA_BASE_URL,
-  normalizeModelId,
   type ModelSpec,
 } from "./models/catalog.ts";
 import { ONE_LINER, PRODUCT_NAME, SHORT_NAME } from "./positioning.ts";
 import { fetchOpenRouterKeyUsage, formatUsd } from "./openrouter/usage.ts";
 import {
   cycleSessionMode,
+  deriveTaskTitle,
   formatFooterChrome,
+  formatSidebarLines,
   formatTokenBar,
   gitBranch,
   normalizeSessionMode,
-  resolveSession,
+  sidebarWidthFor,
+  SIDEBAR_MIN_TERM_WIDTH,
   type SessionUsage,
+  type SidebarData,
+  type SidebarLine,
+  type SidebarMcpEntry,
 } from "./session.ts";
+import { InMemorySessionManager } from "./session-manager/manager.ts";
+import { freshUsage, type HarnesSession, type SessionManager } from "./session-manager/types.ts";
+import { resolveSessionState, setSessionModel, setSessionMode } from "./session-manager/session-model.ts";
+import {
+  abortSessionTurn,
+  finishSessionTurn,
+  startSessionTurn,
+  SessionAbortRegistry,
+} from "./session-manager/session-turn.ts";
+import {
+  canEnterAllMode,
+  ensureSessionCount,
+  formatAllModeGrid,
+  PaneTranscriptStore,
+} from "./all-mode/index.ts";
 import { applyUpdate, checkForUpdate, NPM_PACKAGE } from "./update.ts";
 import { selectFromList, type SelectItem } from "./ui/select.ts";
 import { HARNES_VERSION } from "./version.ts";
 
 export type { SessionUsage };
 
-function emptySessionUsage(): SessionUsage {
-  return {
-    turns: 0,
-    agentSteps: 0,
-    toolCalls: 0,
-    promptTokens: 0,
-    completionTokens: 0,
-    costUsd: 0,
-  };
-}
-
 /** Animated status line that rewrites in place so long turns don't look stuck. */
-function startStatusLine(initial = "Running"): {
+function startStatusLine(
+  initial = "Running",
+  opts?: { onPaint?: () => void; maxWidth?: () => number }
+): {
   update: (text: string) => void;
   /** Print a durable trail line above the spinner (tools / narration). */
   note: (line: string) => void;
@@ -77,13 +91,20 @@ function startStatusLine(initial = "Running"): {
   let i = 0;
   let label = initial;
   let stopped = false;
+  const clip = (text: string): string => {
+    const max = opts?.maxWidth?.() ?? 0;
+    if (max <= 8) return text;
+    // Clip by visible width so ANSI-styled notes don't blow past the main column.
+    const plain = text.replace(/\x1b\[[0-9;]*m/g, "");
+    if (plain.length <= max) return text;
+    return `${plain.slice(0, max - 1)}…`;
+  };
   const render = () => {
     if (stopped) return;
     const frame = frames[i % frames.length];
     i += 1;
     const elapsed = Math.max(0, Math.floor((Date.now() - started) / 1000));
-    const text = `${frame} ${label} · ${elapsed}s`;
-    // Pad then clear to EOL so shorter labels don't leave leftovers.
+    const text = clip(`${frame} ${label} · ${elapsed}s`);
     output.write(`\r${paint(ansi.warm, text)}\x1b[K`);
   };
   render();
@@ -93,37 +114,48 @@ function startStatusLine(initial = "Running"): {
       label = text;
     },
     note(line: string) {
+      const clipped = clip(line);
       if (stopped) {
-        console.log(line);
+        console.log(clipped);
+        opts?.onPaint?.();
         return;
       }
       output.write(`\r\x1b[2K`);
-      console.log(line);
+      console.log(clipped);
       render();
+      opts?.onPaint?.();
     },
     stop(final?: string) {
       if (stopped) return;
       stopped = true;
       clearInterval(id);
       output.write(`\r\x1b[2K`);
-      if (final) console.log(paint(ansi.soft, final));
+      if (final) console.log(paint(ansi.soft, clip(final)));
+      opts?.onPaint?.();
     },
   };
 }
 
 const VERSION = HARNES_VERSION;
-const FOOTER_ROWS = 3; // full-width rule + status + bottom bar
 
 const SLASH_COMMANDS: Array<{ cmd: string; help: string }> = [
   { cmd: "/help", help: "show commands (/h)" },
   { cmd: "/setup", help: "configure OpenRouter or Ollama" },
   { cmd: "/status", help: "model, mode, context, cwd" },
+  { cmd: "/sessions", help: "list sessions (id/title/model/cwd/status; * = focused)" },
+  {
+    cmd: "/session",
+    help: "new [title] · <id|prefix|title> · title <text> · cwd <path> · archive",
+  },
   { cmd: "/todos", help: "show the current task list" },
   { cmd: "/mcp", help: "list configured MCP servers/tools/status" },
   { cmd: "/skills", help: "list available skill files" },
   { cmd: "/model", help: "pick a model (↑↓/click · Enter) · /model <id> · /model auto" },
   { cmd: "/models", help: "same as /model — interactive catalog picker" },
   { cmd: "/mode", help: "auto | manual | ask | plan  (labels: automatic / ask on edit)  ⌃T / ⇧Tab" },
+  { cmd: "/all", help: "All mode — 2×2 panes (up to 4 sessions)" },
+  { cmd: "/single", help: "exit All mode → one pane" },
+  { cmd: "/pane", help: "focus pane 1-4 · /pane new · ⌃P cycle (All mode)" },
   { cmd: "/usage", help: "session + OpenRouter spend" },
   { cmd: "/cost", help: "alias for /usage" },
   { cmd: "/update", help: "check / install latest from npm (/update auto on|off)" },
@@ -141,6 +173,7 @@ const ansi = {
   cmd: "\x1b[38;5;147m",
   soft: "\x1b[38;5;150m",
   warm: "\x1b[38;5;215m",
+  ok: "\x1b[38;5;114m",
   inputBg: "\x1b[48;2;26;32;36m",
   inputFg: "\x1b[38;5;252m",
 };
@@ -192,19 +225,46 @@ function isModeCycleKey(key: TtyKey | undefined): boolean {
   return false;
 }
 
+/** Ctrl+P cycles All-mode pane focus. */
+function isPaneCycleKey(key: TtyKey | undefined): boolean {
+  return Boolean(key?.ctrl && key.name === "p");
+}
+
 export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
   let config = initialConfig;
   const cwd = process.cwd();
   const backend = new LocalBackend(cwd);
   let mcp = new McpManager(config.mcpServers ?? {});
-  const history: ChatMessage[] = [];
-  const todos: TodoItem[] = [];
-  const usage: SessionUsage = emptySessionUsage();
   let lastDone = "";
+  let lastPrompt = "";
   let turnBusy = false;
   let slashBusy = false;
   let painting = false;
-  let turnAbort: AbortController | undefined;
+  /** Slice B All-mode layout; sessions come from Slice A's SessionManager. */
+  let layoutMode: "single" | "all" = "single";
+  const paneTranscripts = new PaneTranscriptStore();
+  /** Session id the in-flight turn belongs to, for Ctrl+C to route abortSessionTurn correctly. */
+  let runningSessionId: string | undefined;
+  let mcpStatusCache: SidebarMcpEntry[] = [];
+
+  /** Cheap, cached MCP status for the sidebar — describeStatus() connects lazily, so never call it on every keystroke repaint. */
+  const refreshMcpStatus = async () => {
+    if (!mcp.enabled) {
+      mcpStatusCache = [];
+      return;
+    }
+    try {
+      const statuses = await mcp.describeStatus();
+      mcpStatusCache = statuses.map((server) => ({
+        name: server.name,
+        connected: server.status === "connected",
+        detail: server.status === "error" ? server.detail : undefined,
+      }));
+    } catch {
+      // Keep the previous cache — a blip shouldn't blank out the sidebar.
+    }
+    paintFooterUnderInput();
+  };
 
   const replaceMcp = async (nextConfig: HarnesConfig) => {
     const prev = JSON.stringify(config.mcpServers ?? {});
@@ -212,6 +272,8 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
     if (prev === next) return;
     await mcp.close();
     mcp = new McpManager(nextConfig.mcpServers ?? {});
+    mcpStatusCache = [];
+    void refreshMcpStatus();
   };
 
   if (!process.stdin.isTTY) {
@@ -238,7 +300,7 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
     console.log(paint(ansi.soft, "Using OPENROUTER_API_KEY from the environment."));
     console.log("");
   } else if (firstRunNeedsWizard) {
-    printWelcomeBox(config, cwd, history, { firstRun: true });
+    printWelcomeBox(config, ephemeralSessionView(config, cwd), { firstRun: true });
     config = await runSetup(config, { nested: false });
   }
 
@@ -258,7 +320,61 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
 
   config = await maybeHandleUpdateOnStart(config);
 
-  printWelcomeBox(config, cwd, history, { firstRun: false });
+  // Slice A — multi-session: one SessionManager + abort registry per process.
+  // Loaded before the welcome box paints so it can reflect a restored focused
+  // session; never lets `sessionManager.focused()` throw below.
+  const sessionManager = new InMemorySessionManager();
+  const abortRegistry = new SessionAbortRegistry();
+  await sessionManager.load();
+  if (sessionManager.loadWarnings.length > 0) {
+    for (const warning of sessionManager.loadWarnings) {
+      console.log(paint(ansi.muted, `(sessions) ${warning}`));
+    }
+    console.log("");
+  }
+  if (sessionManager.list().length === 0) {
+    sessionManager.create({
+      cwd,
+      title: "Session 1",
+      pinnedModelId: config.pinnedModelId,
+      sessionMode: normalizeSessionMode(config.sessionMode),
+    });
+  }
+  /** Focused-session accessor — history/todos/usage/model/cwd all flow through this. */
+  const session = (): HarnesSession => sessionManager.focused();
+
+  const allModeSlots = (): Array<HarnesSession | null> => {
+    const list = sessionManager.list();
+    return [0, 1, 2, 3].map((i) => list[i] ?? null);
+  };
+
+  const paintAllModeBlock = (): { text: string; rows: number } | null => {
+    if (layoutMode !== "all") return null;
+    const width = process.stdout.columns || 80;
+    const rows = process.stdout.rows || 24;
+    const slots = allModeSlots();
+    const transcripts: Record<string, string[]> = {};
+    for (const s of slots) {
+      if (s) transcripts[s.id] = paneTranscripts.get(s.id);
+    }
+    const grid = formatAllModeGrid({
+      sessions: slots,
+      transcripts,
+      focusedId: session().id,
+      termWidth: width,
+      termRows: rows,
+      hostLabel: "local",
+    });
+    if (!grid.ok) return { text: paint(ansi.warm, grid.reason), rows: 1 };
+    const painted = grid.lines.map((line) => {
+      if (line.startsWith("All mode")) return paint(ansi.muted, line);
+      if (line.includes("▸")) return paint(ansi.accentBright, line);
+      return paint(ansi.accent, line);
+    });
+    return { text: painted.join("\n"), rows: painted.length };
+  };
+
+  printWelcomeBox(config, session(), { firstRun: false });
 
   const rl = readline.createInterface({
     input,
@@ -267,33 +383,96 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
     completer: slashCompleter,
   }) as RlWithTty;
 
-  const footerBlock = (): string => {
-    const session = resolveSession(config, history);
+  const sidebarPaintColor = (kind: SidebarLine["kind"]): string => {
+    if (kind === "title") return ansi.bold + ansi.accentBright;
+    if (kind === "header") return ansi.muted;
+    if (kind === "muted") return ansi.dim + ansi.muted;
+    if (kind === "ok") return ansi.ok;
+    return ansi.accent;
+  };
+
+  const mainColumnWidth = (): number => {
+    const width = Math.max(20, process.stdout.columns || 80);
+    if (width < SIDEBAR_MIN_TERM_WIDTH) return width;
+    return Math.max(40, width - sidebarWidthFor(width) - 2);
+  };
+
+  /**
+   * Sticky right-rail in the visible viewport (Task / Context / MCP / LSP / Todo).
+   * Uses absolute cursor moves + save/restore so it sits beside the transcript
+   * like the reference screenshot — not a left-padded block under the prompt.
+   */
+  const paintSidebarRail = () => {
+    const width = Math.max(20, process.stdout.columns || 80);
+    const rows = Math.max(12, process.stdout.rows || 24);
+    if (width < SIDEBAR_MIN_TERM_WIDTH) return;
+
+    const sw = sidebarWidthFor(width);
+    const col = width - sw + 1; // 1-based
+    const activeSession = session();
+    const active = resolveSessionState(activeSession, config);
+    const data: SidebarData = {
+      taskTitle: deriveTaskTitle(activeSession.todos, lastPrompt),
+      tokensUsed: active.tokensUsed,
+      contextWindow: active.contextWindow,
+      costUsd: activeSession.usage.costUsd,
+      mcp: mcpStatusCache,
+      lsp: [], // TODO(docs/lsp-plan.md): populate once Harnes has a real LSP client — never fake entries.
+      todos: activeSession.todos,
+    };
+    const lines = formatSidebarLines(data, sw);
+    // Leave the bottom rows for prompt + footer.
+    const maxRows = Math.max(4, rows - 4);
+    const startRow = 1;
+
+    output.write("\x1b7"); // save cursor
+    for (let i = 0; i < maxRows; i += 1) {
+      output.write(`\x1b[${startRow + i};${col}H`);
+      if (i < lines.length) {
+        const line = lines[i];
+        const raw = line.text;
+        const clipped = raw.length > sw ? `${raw.slice(0, sw - 1)}…` : raw;
+        const colored = clipped ? paint(sidebarPaintColor(line.kind), clipped) : "";
+        output.write(colored);
+        const pad = Math.max(0, sw - visibleWidth(clipped));
+        if (pad > 0) output.write(" ".repeat(pad));
+      } else {
+        output.write(" ".repeat(sw));
+      }
+    }
+    output.write("\x1b8"); // restore cursor
+  };
+
+  const footerBlock = (): { text: string; rows: number } => {
+    const activeSession = session();
+    const active = resolveSessionState(activeSession, config);
+    const sessionCwd = activeSession.cwd;
     const width = process.stdout.columns || 80;
     const chrome = formatFooterChrome({
-      session,
-      cwd,
+      session: active,
+      cwd: sessionCwd,
       width,
-      costUsd: usage.costUsd,
+      costUsd: activeSession.usage.costUsd,
       lastDone: lastDone || undefined,
     });
     const chip = (label: string) => `${ansi.inputBg}${ansi.inputFg} ${label} ${ansi.reset}`;
-    const branch = gitBranch(cwd);
+    const branch = gitBranch(sessionCwd);
     const chips = [
       chip("◆"),
-      chip(session.modeLabel),
-      chip(shortCwd(cwd)),
+      chip(active.modeLabel),
+      chip(shortCwd(sessionCwd)),
       ...(branch ? [chip(branch)] : []),
     ].join(" ");
-    const barRight = session.routing === "pinned" ? "pinned" : "/mode";
+    const barRight = active.routing === "pinned" ? "pinned" : "/mode";
     const gap = Math.max(1, width - visibleWidth(chips) - barRight.length);
     const bar = `${chips}${" ".repeat(gap)}${paint(ansi.muted, barRight)}`;
-    return `${paint(ansi.dim, chrome.separator)}\n${paint(ansi.muted, chrome.status)}\n${bar}`;
+    const text = `${paint(ansi.dim, chrome.separator)}\n${paint(ansi.muted, chrome.status)}\n${bar}`;
+    return { text, rows: 3 };
   };
 
   /** Keep the status strip under the input while typing (readline otherwise wipes it). */
-  const paintFooterUnderInput = () => {
-    if (turnBusy || painting || slashBusy) return;
+  const paintFooterUnderInput = (opts?: { force?: boolean }) => {
+    if ((!opts?.force && turnBusy) || painting || slashBusy) return;
     painting = true;
     try {
       const plainPrompt = " › ";
@@ -304,10 +483,15 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
       const absCol = plainPrompt.length + cursor;
       const rowInInput = Math.floor(absCol / width);
       const col = (absCol % width) + 1;
-      // Clear below prompt, paint footer, then move cursor back onto the input row.
-      output.write(`\n\x1b[0J${footerBlock()}`);
-      const up = FOOTER_ROWS + (inputRows - 1 - rowInInput);
+      const allBlock = paintAllModeBlock();
+      const footer = footerBlock();
+      const chrome = allBlock ? `${allBlock.text}\n${footer.text}` : footer.text;
+      const chromeRows = (allBlock?.rows ?? 0) + footer.rows + (allBlock ? 1 : 0);
+      output.write(`\n\x1b[0J${chrome}`);
+      const up = chromeRows + (inputRows - 1 - rowInInput);
       output.write(`\x1b[${up}A\x1b[${col}G`);
+      // Sidebar only in single mode — All mode already fills the right half with panes.
+      if (layoutMode === "single") paintSidebarRail();
     } finally {
       painting = false;
     }
@@ -330,13 +514,18 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
 
   const cycleModeFromKey = async () => {
     if (turnBusy) return;
-    const nextMode = cycleSessionMode(normalizeSessionMode(config.sessionMode));
-    config = {
-      ...config,
-      sessionMode: nextMode,
-      permissionMode: permissionForSessionMode(nextMode),
-    };
-    await saveConfig(config);
+    const activeSession = session();
+    const nextMode = cycleSessionMode(normalizeSessionMode(activeSession.sessionMode));
+    sessionManager.update(activeSession.id, { sessionMode: nextMode });
+    paintFooterUnderInput();
+  };
+
+  const cyclePaneFocus = () => {
+    if (turnBusy || layoutMode !== "all") return;
+    const slots = ensureSessionCount(sessionManager, 4, cwd);
+    const focused = session();
+    const idx = Math.max(0, slots.findIndex((s) => s.id === focused.id));
+    sessionManager.focus(slots[(idx + 1) % slots.length]!.id);
     paintFooterUnderInput();
   };
 
@@ -345,6 +534,10 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
     rl._ttyWrite = (s, key) => {
       if (isModeCycleKey(key)) {
         void cycleModeFromKey();
+        return;
+      }
+      if (isPaneCycleKey(key)) {
+        cyclePaneFocus();
         return;
       }
       originalTtyWrite(s, key);
@@ -362,7 +555,12 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
     rl.close();
     await backend.close();
     await mcp.close();
-    await printUsage(usage, config, history);
+    await printUsage(session(), config);
+    try {
+      await sessionManager.save();
+    } catch (error) {
+      console.error(`(sessions) failed to save: ${error instanceof Error ? error.message : String(error)}`);
+    }
   };
 
   rl.on("SIGINT", () => {
@@ -371,8 +569,7 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
       output.write(`${paint(ansi.muted, "(finish /setup or press Enter — Ctrl+C ignored during slash wizards)")}\n`);
       return;
     }
-    if (turnBusy && turnAbort && !turnAbort.signal.aborted) {
-      turnAbort.abort();
+    if (turnBusy && runningSessionId && abortSessionTurn(abortRegistry, runningSessionId)) {
       clearBelowInput();
       output.write(`${paint(ansi.muted, "(interrupted — stopping this turn…)")}\n`);
       return;
@@ -383,6 +580,7 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
   });
 
   showIdle();
+  void refreshMcpStatus();
 
   for await (const line of rl) {
     clearBelowInput();
@@ -408,12 +606,19 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
             config = next;
             await saveConfig(config);
           },
-          history,
-          todos,
-          usage,
+          sessionManager,
+          session,
           cwd,
           rl,
           getMcp: () => mcp,
+          allMode: {
+            getLayout: () => layoutMode,
+            setLayout: (mode) => {
+              layoutMode = mode;
+            },
+            transcripts: paneTranscripts,
+            repaint: () => paintFooterUnderInput(),
+          },
         });
         if (done === "exit") break;
       } finally {
@@ -425,14 +630,25 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
 
     try {
       turnBusy = true;
-      turnAbort = new AbortController();
-      lastDone = await runTurn(text, config, backend, mcp, history, todos, usage, rl, cwd, turnAbort.signal);
+      const activeSession = session();
+      runningSessionId = activeSession.id;
+      lastPrompt = text;
+      paneTranscripts.append(activeSession.id, `> ${text.slice(0, 80)}`);
+      lastDone = await runTurn(text, config, sessionManager, abortRegistry, activeSession, backend, mcp, rl, {
+        onChrome: () => {
+          if (layoutMode === "all") paintFooterUnderInput({ force: true });
+          else paintSidebarRail();
+        },
+        mainWidth: mainColumnWidth,
+        onTranscript: (line) => paneTranscripts.append(activeSession.id, line),
+      });
     } catch (error) {
       console.error(error instanceof Error ? error.message : error);
       lastDone = "error";
     } finally {
-      turnAbort = undefined;
+      runningSessionId = undefined;
     }
+    void refreshMcpStatus();
     showIdle();
   }
 
@@ -463,15 +679,29 @@ function slashCompleter(line: string): [string[], string] {
   return [bases.length ? bases : hits, line];
 }
 
-function printWelcomeBox(
-  config: HarnesConfig,
-  cwd: string,
-  history: ChatMessage[],
-  opts: { firstRun: boolean }
-): void {
+/** Ad-hoc session-shaped view used only for the pre-wizard welcome box, before the real SessionManager exists. */
+function ephemeralSessionView(config: HarnesConfig, cwd: string): HarnesSession {
+  return {
+    id: "pending",
+    title: "Setup",
+    cwd,
+    pinnedModelId: config.pinnedModelId,
+    sessionMode: normalizeSessionMode(config.sessionMode),
+    history: [],
+    todos: [],
+    usage: freshUsage(),
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    status: "idle",
+  };
+}
+
+function printWelcomeBox(config: HarnesConfig, activeSession: HarnesSession, opts: { firstRun: boolean }): void {
+  const cwd = activeSession.cwd;
+  const history = activeSession.history;
   const cols = Math.min(process.stdout.columns || 88, 92);
   const inner = Math.max(40, cols - 4);
-  const session = resolveSession(config, history);
+  const session = resolveSessionState(activeSession, config);
   const title = ` ${SHORT_NAME} v${VERSION} `;
   const top =
     paint(ansi.accent, "╭─") +
@@ -676,12 +906,17 @@ async function handleSlash(
   ctx: {
     getConfig: () => HarnesConfig;
     setConfig: (config: HarnesConfig) => Promise<void>;
-    history: ChatMessage[];
-    todos: TodoItem[];
-    usage: SessionUsage;
+    sessionManager: SessionManager;
+    session: () => HarnesSession;
     cwd: string;
     rl: readline.Interface;
     getMcp: () => McpManager;
+    allMode?: {
+      getLayout: () => "single" | "all";
+      setLayout: (mode: "single" | "all") => void;
+      transcripts: PaneTranscriptStore;
+      repaint: () => void;
+    };
   }
 ): Promise<"ok" | "exit"> {
   const [cmd, ...rest] = text.slice(1).split(/\s+/);
@@ -696,19 +931,77 @@ async function handleSlash(
     case "h":
       printSlashMenu();
       return "ok";
-    case "clear":
-      ctx.history.length = 0;
-      ctx.todos.length = 0;
-      Object.assign(ctx.usage, emptySessionUsage());
-      console.log(paint(ansi.muted, "Session cleared (context + session cost reset)."));
+    case "all": {
+      if (!ctx.allMode) {
+        console.log("All mode unavailable.");
+        return "ok";
+      }
+      const width = process.stdout.columns || 80;
+      const rows = process.stdout.rows || 24;
+      const gate = canEnterAllMode(width, rows);
+      if (!gate.ok) {
+        console.log(paint(ansi.warm, gate.reason));
+        return "ok";
+      }
+      ensureSessionCount(ctx.sessionManager, 4, ctx.cwd);
+      ctx.allMode.setLayout("all");
+      console.log(paint(ansi.soft, "All mode on · ⌃P cycle panes · /pane 1-4 · /single to exit"));
+      ctx.allMode.repaint();
       return "ok";
-    case "todos":
-      if (ctx.todos.length === 0) {
+    }
+    case "single": {
+      if (!ctx.allMode) return "ok";
+      ctx.allMode.setLayout("single");
+      console.log(paint(ansi.muted, "Single pane."));
+      return "ok";
+    }
+    case "pane": {
+      if (!ctx.allMode) {
+        console.log("All mode unavailable.");
+        return "ok";
+      }
+      const mgr = ctx.sessionManager;
+      if (!arg || arg === "next") {
+        const slots = ensureSessionCount(mgr, 4, ctx.cwd);
+        const focused = ctx.session();
+        const idx = Math.max(0, slots.findIndex((s) => s.id === focused.id));
+        mgr.focus(slots[(idx + 1) % slots.length]!.id);
+        console.log(`Focused pane ${slots.findIndex((s) => s.id === mgr.focused().id) + 1} · ${mgr.focused().title}`);
+        return "ok";
+      }
+      if (arg === "new") {
+        const created = mgr.create({ cwd: ctx.cwd, title: `Pane ${mgr.list().length + 1}` });
+        console.log(`Created + focused ${created.title} (${created.id.slice(0, 8)})`);
+        return "ok";
+      }
+      const n = Number(arg);
+      if (n >= 1 && n <= 4) {
+        const slots = ensureSessionCount(mgr, 4, ctx.cwd);
+        mgr.focus(slots[n - 1]!.id);
+        console.log(`Focused pane ${n} · ${mgr.focused().title}`);
+        return "ok";
+      }
+      console.log("Usage: /pane 1-4 | /pane new | /pane next");
+      return "ok";
+    }
+    case "clear": {
+      const s = ctx.session();
+      s.history.length = 0;
+      s.todos.length = 0;
+      Object.assign(s.usage, freshUsage());
+      ctx.allMode?.transcripts.clear(s.id);
+      console.log(paint(ansi.muted, `Session "${s.title}" cleared (context + session cost reset).`));
+      return "ok";
+    }
+    case "todos": {
+      const s = ctx.session();
+      if (s.todos.length === 0) {
         console.log(paint(ansi.muted, "No todos yet. The agent creates them for multi-step tasks."));
       } else {
-        console.log(formatTodoList(ctx.todos));
+        console.log(formatTodoList(s.todos));
       }
       return "ok";
+    }
     case "mcp":
       await printMcpStatus(ctx.getMcp());
       return "ok";
@@ -729,44 +1022,44 @@ async function handleSlash(
       return "ok";
     case "usage":
     case "cost":
-      await printUsage(ctx.usage, ctx.getConfig(), ctx.history);
+      await printUsage(ctx.session(), ctx.getConfig());
       return "ok";
     case "status": {
-      printFullStatus(ctx.getConfig(), ctx.history, ctx.cwd, ctx.usage, ctx.todos);
+      printFullStatus(ctx.getConfig(), ctx.session());
       return "ok";
     }
     case "update":
       await handleUpdateCommand(ctx, arg);
       return "ok";
+    case "sessions":
+      printSessionsList(ctx.sessionManager);
+      return "ok";
+    case "session":
+      await handleSessionCommand(ctx, rest);
+      return "ok";
     case "mode": {
       if (!arg) {
-        const session = resolveSession(ctx.getConfig(), ctx.history);
+        const session = resolveSessionState(ctx.session(), ctx.getConfig());
         console.log(`mode ${session.modeLabel} (${session.mode}) · tools ${session.permissionMode}`);
         console.log(paint(ansi.muted, `cycle: ${SESSION_MODES.map((m) => SESSION_MODE_LABELS[m]).join(" → ")}`));
         return "ok";
       }
-      const aliases = new Set(["auto", "automatic", "manual", "ask", "ask-on-edit", "plan", "build"]);
-      if (!aliases.has(arg.toLowerCase())) {
-        console.log("Usage: /mode auto|manual|ask|plan   (or ⌃T / ⇧Tab)");
+      const result = setSessionMode(ctx.sessionManager, ctx.session(), arg);
+      if (!result.ok) {
+        console.log(result.error);
         return "ok";
       }
-      if (arg.toLowerCase() === "build") {
+      if (result.legacyBuildAlias) {
         console.log(paint(ansi.muted, 'Note: legacy alias "build" maps to mode auto (permission=build tools).'));
       }
-      const sessionMode = normalizeSessionMode(arg);
-      await ctx.setConfig({
-        ...ctx.getConfig(),
-        sessionMode,
-        permissionMode: permissionForSessionMode(sessionMode),
-      });
-      const session = resolveSession(ctx.getConfig(), ctx.history);
+      const session = resolveSessionState(ctx.session(), ctx.getConfig());
       console.log(`mode ${session.modeLabel} · tools ${session.permissionMode} · ${session.model.name}`);
       return "ok";
     }
     case "setup": {
       const next = await runSetup(ctx.getConfig(), { nested: true, rl: ctx.rl });
       await ctx.setConfig(next);
-      printWelcomeBox(next, ctx.cwd, ctx.history, { firstRun: false });
+      printWelcomeBox(next, ctx.session(), { firstRun: false });
       return "ok";
     }
     default: {
@@ -782,7 +1075,30 @@ async function handleSlash(
 }
 
 function suggestSlashCommand(raw: string): string | undefined {
-  const names = ["help", "setup", "status", "todos", "mcp", "skills", "model", "models", "mode", "usage", "cost", "update", "clear", "exit", "quit", "q", "h"];
+  const names = [
+    "help",
+    "setup",
+    "status",
+    "sessions",
+    "session",
+    "todos",
+    "mcp",
+    "skills",
+    "model",
+    "models",
+    "mode",
+    "all",
+    "single",
+    "pane",
+    "usage",
+    "cost",
+    "update",
+    "clear",
+    "exit",
+    "quit",
+    "q",
+    "h",
+  ];
   const needle = raw.toLowerCase();
   let best: string | undefined;
   let bestDist = 3;
@@ -794,6 +1110,119 @@ function suggestSlashCommand(raw: string): string | undefined {
     }
   }
   return best;
+}
+
+/** First 8 chars of a session id — used in listings/messages so ids stay readable. */
+function shortSessionId(id: string): string {
+  return id.slice(0, 8);
+}
+
+function printSessionsList(sessionManager: SessionManager): void {
+  const list = sessionManager.list();
+  if (list.length === 0) {
+    console.log(paint(ansi.muted, "No sessions. /session new to create one."));
+    return;
+  }
+  let focusedId: string | undefined;
+  try {
+    focusedId = sessionManager.focused().id;
+  } catch {
+    focusedId = undefined;
+  }
+  console.log(paint(ansi.accentBright, "Sessions"));
+  for (const s of list) {
+    const mark = s.id === focusedId ? "*" : " ";
+    const model = s.pinnedModelId ?? "auto";
+    console.log(
+      `  ${mark} ${paint(ansi.cmd, shortSessionId(s.id))}  ${s.title.padEnd(20)} ${model.padEnd(24)} ${shortCwd(s.cwd).padEnd(24)} ${s.status}`
+    );
+  }
+}
+
+/**
+ * Resolves a `/session <needle>` argument to a session: exact id match first,
+ * then a unique short-id prefix, then a unique case-insensitive title match.
+ * Ambiguous prefixes/titles (more than one hit) are treated as no match
+ * rather than guessing.
+ */
+function resolveSessionTarget(sessionManager: SessionManager, needle: string): HarnesSession | undefined {
+  const list = sessionManager.list();
+  const exact = list.find((s) => s.id === needle);
+  if (exact) return exact;
+  const prefixMatches = list.filter((s) => s.id.startsWith(needle));
+  if (prefixMatches.length === 1) return prefixMatches[0];
+  const titleMatches = list.filter((s) => s.title.toLowerCase() === needle.toLowerCase());
+  if (titleMatches.length === 1) return titleMatches[0];
+  return undefined;
+}
+
+async function handleSessionCommand(
+  ctx: { sessionManager: SessionManager; session: () => HarnesSession; cwd: string },
+  args: string[]
+): Promise<void> {
+  const [sub, ...subRest] = args;
+  const subArg = subRest.join(" ").trim();
+
+  if (!sub || sub === "new") {
+    const created = ctx.sessionManager.create({
+      cwd: ctx.session().cwd,
+      title: subArg || undefined,
+    });
+    console.log(paint(ansi.soft, `Created and focused session ${shortSessionId(created.id)} "${created.title}".`));
+    return;
+  }
+
+  if (sub === "title") {
+    if (!subArg) {
+      console.log("Usage: /session title <text>");
+      return;
+    }
+    const updated = ctx.sessionManager.update(ctx.session().id, { title: subArg });
+    console.log(`Renamed session to "${updated.title}".`);
+    return;
+  }
+
+  if (sub === "cwd") {
+    if (!subArg) {
+      console.log("Usage: /session cwd <path>");
+      return;
+    }
+    const resolved = resolvePath(subArg);
+    if (!existsSync(resolved)) {
+      console.log(paint(ansi.warm, `Path does not exist: ${resolved}`));
+      return;
+    }
+    const updated = ctx.sessionManager.update(ctx.session().id, { cwd: resolved });
+    console.log(`Session cwd set to ${shortCwd(updated.cwd)}.`);
+    console.log(
+      paint(
+        ansi.muted,
+        "(Slice A: tool execution stays sandboxed to Harnes's launch directory — session cwd affects display/skills, not the tool sandbox root.)"
+      )
+    );
+    return;
+  }
+
+  if (sub === "archive") {
+    const current = ctx.session();
+    ctx.sessionManager.archive(current.id);
+    let next: HarnesSession;
+    try {
+      next = ctx.sessionManager.focused();
+    } catch {
+      next = ctx.sessionManager.create({ cwd: ctx.cwd, title: "Session 1" });
+    }
+    console.log(`Archived "${current.title}". Focused "${next.title}" (${shortSessionId(next.id)}).`);
+    return;
+  }
+
+  const target = resolveSessionTarget(ctx.sessionManager, sub);
+  if (!target) {
+    console.log(`No session matches "${sub}". Try /sessions to list, or /session new.`);
+    return;
+  }
+  const focused = ctx.sessionManager.focus(target.id);
+  console.log(`Focused "${focused.title}" (${shortSessionId(focused.id)}).`);
 }
 
 function editDistance(a: string, b: string): number {
@@ -891,12 +1320,12 @@ async function loadSelectableModels(config: HarnesConfig): Promise<ModelSpec[]> 
 
 async function pickModelInteractive(ctx: {
   getConfig: () => HarnesConfig;
-  setConfig: (config: HarnesConfig) => Promise<void>;
-  history: ChatMessage[];
+  sessionManager: SessionManager;
+  session: () => HarnesSession;
   rl: readline.Interface;
 }): Promise<void> {
   const config = ctx.getConfig();
-  const session = resolveSession(config, ctx.history);
+  const session = resolveSessionState(ctx.session(), config);
   const endpoint = resolveChatEndpoint(config);
   const models = await loadSelectableModels(config);
 
@@ -964,34 +1393,36 @@ async function pickModelInteractive(ctx: {
 async function setModel(
   ctx: {
     getConfig: () => HarnesConfig;
-    setConfig: (config: HarnesConfig) => Promise<void>;
-    history: ChatMessage[];
+    sessionManager: SessionManager;
+    session: () => HarnesSession;
   },
   arg: string
 ): Promise<void> {
-  if (arg === "auto") {
-    const next = { ...ctx.getConfig() };
-    delete next.pinnedModelId;
-    await ctx.setConfig(next);
+  if (arg.trim().toLowerCase() !== "auto") {
+    // Warm the OpenRouter catalog cache so a freshly-released model id resolves.
+    try {
+      const endpoint = resolveChatEndpoint(ctx.getConfig());
+      if (endpoint.provider === "openrouter") {
+        try {
+          await listOpenRouterModels({ apiKey: endpoint.apiKey });
+        } catch {
+          /* curated fallback */
+        }
+      }
+    } catch {
+      /* endpoint resolution failed; setSessionModel below will surface it */
+    }
+  }
+  const result = setSessionModel(ctx.sessionManager, ctx.session(), arg, ctx.getConfig());
+  if (!result.ok) {
+    console.log(result.error);
+    return;
+  }
+  if (!result.model) {
     console.log("Model routing: auto");
     return;
   }
-  try {
-    const endpoint = resolveChatEndpoint(ctx.getConfig());
-    if (endpoint.provider === "openrouter") {
-      try {
-        await listOpenRouterModels({ apiKey: endpoint.apiKey });
-      } catch {
-        /* curated fallback */
-      }
-    }
-    const model = getModel(normalizeModelId(arg));
-    const pinId = endpoint.provider === "openrouter" ? (model.openrouterModel ?? model.id) : model.id;
-    await ctx.setConfig({ ...ctx.getConfig(), pinnedModelId: pinId });
-    console.log(`Pinned ${model.name} (${pinId}) · ctx ${model.minContext.toLocaleString()}`);
-  } catch (error) {
-    console.log(error instanceof Error ? error.message : String(error));
-  }
+  console.log(`Pinned ${result.model.name} (${result.pinnedModelId}) · ctx ${result.model.minContext.toLocaleString()}`);
 }
 
 function summarizeTool(call: { name: string; arguments: Record<string, string> }): string {
@@ -1046,14 +1477,13 @@ function summarizeAssistantNarration(content: string, max = 120): string {
 async function runTurn(
   prompt: string,
   config: HarnesConfig,
+  sessionManager: SessionManager,
+  abortRegistry: SessionAbortRegistry,
+  activeSession: HarnesSession,
   backend: LocalBackend,
   mcp: McpManager,
-  history: ChatMessage[],
-  todos: TodoItem[],
-  usage: SessionUsage,
   rl: readline.Interface,
-  cwd: string,
-  signal?: AbortSignal
+  chrome?: { onChrome?: () => void; mainWidth?: () => number; onTranscript?: (line: string) => void }
 ): Promise<string> {
   if (!hasUsableApiKey(config) && config.provider !== "ollama") {
     console.log("No API key configured. Run /setup first.");
@@ -1061,10 +1491,17 @@ async function runTurn(
   }
 
   const started = Date.now();
-  let status = startStatusLine("Running");
-  const session = resolveSession(config, history, prompt);
+  let status = startStatusLine("Running", {
+    onPaint: chrome?.onChrome,
+    maxWidth: chrome?.mainWidth,
+  });
+  const session = resolveSessionState(activeSession, config, prompt);
   const endpoint = resolveChatEndpoint(config);
   const mode = session.mode;
+  // A5: registers the abort controller for this session and flips status -> "running".
+  const signal = startSessionTurn(sessionManager, abortRegistry, activeSession);
+  const noteTranscript = (line: string) =>
+    chrome?.onTranscript?.(line.replace(/\x1b\[[0-9;]*m/g, "").trim());
 
   try {
     const result = await runAgentLoop({
@@ -1072,32 +1509,39 @@ async function runTurn(
       model: { ...session.model, providerModel: session.wireId },
       backend,
       permissionMode: session.permissionMode,
-      history,
-      todos,
+      history: activeSession.history,
+      todos: activeSession.todos,
       mcp: mcp.enabled ? mcp : undefined,
-      cwd,
+      cwd: activeSession.cwd,
       hooks: config.hooks,
       signal,
       complete: (input) => openaiCompatibleComplete(endpoint.baseUrl, endpoint.apiKey, input),
       onProgress: (event: LoopProgress) => {
         if (event.type === "thinking") {
           status.update(`Thinking · step ${event.step}`);
+          chrome?.onChrome?.();
           return;
         }
         if (event.type === "assistant") {
           const line = summarizeAssistantNarration(event.content);
-          if (line) status.note(paint(ansi.muted, `  ${line}`));
+          if (line) {
+            status.note(paint(ansi.muted, `  ${line}`));
+            noteTranscript(line);
+          }
           status.update(`Working · step ${event.step}`);
           return;
         }
         if (event.type === "subagent") {
           status.note(paint(ansi.muted, `↳ subagent: ${event.task}`));
+          noteTranscript(`subagent: ${event.task}`);
           status.update(`subagent · step ${event.step}`);
           return;
         }
         // tool
         if (event.phase === "start") {
-          status.note(paint(ansi.accentBright, `→ ${summarizeTool(event)}`));
+          const summary = summarizeTool(event);
+          status.note(paint(ansi.accentBright, `→ ${summary}`));
+          noteTranscript(`→ ${summary}`);
           status.update(`${event.name} · step ${event.step}`);
           return;
         }
@@ -1105,6 +1549,7 @@ async function runTurn(
         const color = event.ok === false ? ansi.warm : ansi.muted;
         const preview = event.preview ? ` · ${event.preview}` : "";
         status.note(paint(color, `  ${mark} ${event.name}${preview}`));
+        noteTranscript(`${mark} ${event.name}${preview}`);
         status.update(`Thinking · step ${event.step}`);
       },
       onApprove: async (call) => {
@@ -1117,7 +1562,11 @@ async function runTurn(
           .toLowerCase();
         if (signal?.aborted) return false;
         const ok = answer === "" || answer === "y" || answer === "yes";
-        status = startStatusLine(ok ? call.name : "Running");
+        status = startStatusLine(ok ? call.name : "Running", {
+          onPaint: chrome?.onChrome,
+          maxWidth: chrome?.mainWidth,
+        });
+        chrome?.onChrome?.();
         return ok;
       },
     });
@@ -1127,10 +1576,12 @@ async function runTurn(
 
     if (result.stoppedReason === "aborted") {
       status.stop(`✗ Interrupted · ${elapsedSec}s · ${result.steps} step${result.steps === 1 ? "" : "s"}`);
+      finishSessionTurn(sessionManager, abortRegistry, activeSession, { ok: false, error: "aborted" });
       // Do not commit a partial/invalid transcript into session history.
       return `✗ ${elapsedSec}s interrupted`;
     }
 
+    const usage = activeSession.usage;
     usage.turns += 1;
     usage.agentSteps += result.steps;
     usage.toolCalls += result.messages.filter((message) => message.role === "tool").length;
@@ -1138,8 +1589,16 @@ async function runTurn(
     usage.completionTokens += result.usage.completionTokens;
     usage.costUsd += result.usage.costUsd ?? 0;
 
-    history.length = 0;
-    history.push(...compactHistoryMessages(result.messages));
+    activeSession.history.length = 0;
+    activeSession.history.push(...compactHistoryMessages(result.messages));
+
+    // "complete" -> ok; max-steps/denied/anything else -> reported as the stoppedReason itself.
+    finishSessionTurn(
+      sessionManager,
+      abortRegistry,
+      activeSession,
+      result.stoppedReason === "complete" ? { ok: true } : { ok: false, error: result.stoppedReason }
+    );
 
     const costPart =
       endpoint.provider === "openrouter" || turnCost > 0
@@ -1161,6 +1620,19 @@ async function runTurn(
     const lastUseful = [...assistants].reverse().find((message) => !shouldAutoContinue(message.content));
     const last = lastUseful ?? assistants.at(-1);
     console.log("");
+    const wrapMain = (text: string): string => {
+      const max = chrome?.mainWidth?.() ?? 0;
+      if (max <= 20) return text;
+      return text
+        .split(/\r?\n/)
+        .map((line) => {
+          if (line.length <= max) return line;
+          const chunks: string[] = [];
+          for (let i = 0; i < line.length; i += max) chunks.push(line.slice(i, i + max));
+          return chunks.join("\n");
+        })
+        .join("\n");
+    };
     if (last && shouldAutoContinue(last.content) && !lastUseful) {
       console.log(
         paint(
@@ -1168,19 +1640,25 @@ async function runTurn(
           "(Model stalled mid-task instead of finishing. Say what you want next, or try /model with a stronger model.)"
         )
       );
-    } else if (last?.content) console.log(last.content);
+    } else if (last?.content) console.log(wrapMain(last.content));
     else console.log(paint(ansi.muted, `(${result.stoppedReason} after ${result.steps} steps)`));
+    chrome?.onChrome?.();
 
     // Compact sticky form for the always-on footer
     return `✓ ${elapsedSec}s/${result.steps} · ${formatUsd(turnCost)}`;
   } catch (error) {
     status.stop();
+    finishSessionTurn(sessionManager, abortRegistry, activeSession, {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
     throw error;
   }
 }
 
-async function printUsage(usage: SessionUsage, config: HarnesConfig, history: ChatMessage[]): Promise<void> {
-  const session = resolveSession(config, history);
+async function printUsage(activeSession: HarnesSession, config: HarnesConfig): Promise<void> {
+  const usage = activeSession.usage;
+  const session = resolveSessionState(activeSession, config);
   const endpoint = resolveChatEndpoint(config);
   console.log(paint(ansi.accentBright, "This session"));
   console.log(
@@ -1213,15 +1691,12 @@ async function printUsage(usage: SessionUsage, config: HarnesConfig, history: Ch
   }
 }
 
-function printFullStatus(
-  config: HarnesConfig,
-  history: ChatMessage[],
-  cwd: string,
-  usage: SessionUsage,
-  todos: TodoItem[]
-): void {
-  const session = resolveSession(config, history);
+function printFullStatus(config: HarnesConfig, activeSession: HarnesSession): void {
+  const session = resolveSessionState(activeSession, config);
   const endpoint = resolveChatEndpoint(config);
+  const usage = activeSession.usage;
+  const todos = activeSession.todos;
+  console.log(`session    ${activeSession.title} (${shortSessionId(activeSession.id)})`);
   console.log(`provider   ${endpoint.provider}`);
   console.log(`baseUrl    ${endpoint.baseUrl}`);
   console.log(`key        ${maskKey(endpoint.apiKey)}`);
@@ -1229,8 +1704,8 @@ function printFullStatus(
   console.log(`mode       ${session.modeLabel} (${session.mode}) · tools ${session.permissionMode}`);
   console.log(`autoUpdate ${config.autoUpdate ? "on" : "off"}`);
   console.log(`context    ~${formatTokenBar(session.tokensUsed, session.contextWindow)} (estimate)`);
-  console.log(`cwd        ${shortCwd(cwd)}`);
-  console.log(`history    ${history.length} messages`);
+  console.log(`cwd        ${shortCwd(activeSession.cwd)}`);
+  console.log(`history    ${activeSession.history.length} messages`);
   console.log(`usage      turns=${usage.turns} tools=${usage.toolCalls} spend=${formatUsd(usage.costUsd)}`);
   console.log(`mcp        ${(config.mcpServers && Object.keys(config.mcpServers).length > 0) ? `${Object.keys(config.mcpServers).length} server(s)` : "off"}`);
   if (todos.length > 0) {
