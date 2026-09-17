@@ -3,15 +3,18 @@ import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { configFromEnv, loadConfig, resolveChatEndpoint, saveConfig, type HarnesConfig } from "./config.ts";
 import { LocalBackend } from "./exec/local.ts";
-import { permissionForSessionMode } from "./exec/types.ts";
-import { normalizeSessionMode } from "./session.ts";
+import { needsApproval } from "./exec/types.ts";
+import { formatEvalReport, runEvalSuite } from "./eval/runner.ts";
 import { openaiCompatibleComplete, runAgentLoop } from "./loop.ts";
 import { MODEL_CATALOG, wireModelId } from "./models/catalog.ts";
 import { inferRouteKind, routeTask } from "./models/router.ts";
 import { buildOpenCodeConfig } from "./opencode/config.ts";
 import { CLI_NAME, ONE_LINER, PITCH, PRODUCT_NAME, SHORT_NAME } from "./positioning.ts";
 import { startRepl } from "./repl.ts";
+import { resolveSession } from "./session.ts";
 import { runSmokeSuite, smokePassed } from "./smoke.ts";
+import * as readline from "node:readline/promises";
+import { stdin as input, stdout as output } from "node:process";
 
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
@@ -50,6 +53,9 @@ async function main(): Promise<void> {
     case "run":
       await cmdRun(rest.join(" "), config);
       return;
+    case "eval":
+      await cmdEval(rest, config);
+      return;
     default:
       if (command.startsWith("-")) {
         printHelp();
@@ -73,14 +79,41 @@ Usage:
   ${CLI_NAME} models               curated models
   ${CLI_NAME} route <prompt>       hybrid routing
   ${CLI_NAME} smoke                catalog checks
-  ${CLI_NAME} run <prompt>         one-shot agent turn
+  ${CLI_NAME} run <prompt>         one-shot agent turn (uses pinned model; no TTY approvals)
+  ${CLI_NAME} eval [--live] [--first-step]   tool-call + outcome suite (evals/README.md)
   ${CLI_NAME} opencode-config      print OpenCode-compatible config
+
+Session (TTY): /help · /mode auto|manual|ask|plan · ⌃T cycle · ask/manual approvals only in the REPL
 
 Env:
   OPENROUTER_API_KEY
   HARNES_PROVIDER=openrouter|ollama|openai-compatible
   HARNES_MODEL_BASE_URL  HARNES_MODEL_API_KEY
 `);
+}
+
+async function cmdEval(argv: string[], config: HarnesConfig): Promise<void> {
+  const live = argv.includes("--live");
+  const firstStep = argv.includes("--first-step");
+  const modelFlag = flagValue(argv, "--model");
+  const tagFlag = flagValue(argv, "--tag");
+  const taskFlag = flagValue(argv, "--task");
+  const report = await runEvalSuite({
+    config,
+    live,
+    liveMode: firstStep ? "first-step" : "loop",
+    modelId: modelFlag,
+    tags: tagFlag ? tagFlag.split(",").map((t) => t.trim()).filter(Boolean) : undefined,
+    taskIds: taskFlag ? taskFlag.split(",").map((t) => t.trim()).filter(Boolean) : undefined,
+  });
+  console.log(formatEvalReport(report));
+  if (report.failed > 0) process.exitCode = 1;
+}
+
+function flagValue(argv: string[], name: string): string | undefined {
+  const index = argv.indexOf(name);
+  if (index < 0) return undefined;
+  return argv[index + 1];
 }
 
 async function cmdInit(config: HarnesConfig): Promise<void> {
@@ -125,23 +158,35 @@ async function cmdRun(prompt: string, config: HarnesConfig): Promise<void> {
   if (!prompt) {
     throw new Error("Usage: harnes run <prompt>");
   }
-  const kind = inferRouteKind(prompt);
-  const model = routeTask(kind, config.router);
+  const session = resolveSession(config, [], prompt);
   const backend = new LocalBackend(process.cwd());
   const endpoint = resolveChatEndpoint(config);
-  const wireModel = wireModelId(model, endpoint.provider);
+  const canAsk = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  const rl = canAsk ? readline.createInterface({ input, output, terminal: true }) : undefined;
   try {
+    if (!canAsk && (session.mode === "ask" || session.mode === "manual")) {
+      console.error(
+        `Note: mode is ${session.modeLabel} but stdin is not a TTY — running without approval prompts (as auto). Use the REPL for ask/manual.`
+      );
+    }
     const result = await runAgentLoop({
       prompt,
-      model: { ...model, providerModel: wireModel },
+      model: { ...session.model, providerModel: session.wireId },
       backend,
-      permissionMode: permissionForSessionMode(normalizeSessionMode(config.sessionMode)),
+      permissionMode: session.permissionMode,
+      onApprove: async (call) => {
+        if (!rl || session.mode === "auto" || session.mode === "plan") return true;
+        if (!needsApproval(session.mode, call.name, undefined, call.arguments)) return true;
+        const answer = (await rl.question(`Allow ${call.name}? [Y/n] `)).trim().toLowerCase();
+        return answer === "" || answer === "y" || answer === "yes";
+      },
       complete: (input) => openaiCompatibleComplete(endpoint.baseUrl, endpoint.apiKey, input),
     });
     const last = [...result.messages].reverse().find((message) => message.role === "assistant");
     if (last?.content) console.log(last.content);
     else console.log(`(${result.stoppedReason} after ${result.steps} steps)`);
   } finally {
+    rl?.close();
     await backend.close();
   }
 }

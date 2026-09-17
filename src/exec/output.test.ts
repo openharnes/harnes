@@ -1,16 +1,16 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { truncateList, truncateOutput } from "./output.ts";
+import { formatTruncatedList, truncateList, truncateOutput } from "./output.ts";
 
 describe("truncateOutput", () => {
   it("returns short text unchanged", () => {
     assert.equal(truncateOutput("hello"), "hello");
   });
 
-  it("caps by character count with a byte truncation marker", () => {
+  it("caps by character count with a characters truncation marker", () => {
     const text = "a".repeat(100);
     const result = truncateOutput(text, { maxChars: 10 });
-    assert.equal(result, `${"a".repeat(10)}\n... truncated 90 bytes ...`);
+    assert.equal(result, `${"a".repeat(10)}\n... truncated 90 characters ...`);
   });
 
   it("caps by line count with a line truncation marker", () => {
@@ -41,14 +41,20 @@ describe("truncateOutput", () => {
 
 describe("truncateList", () => {
   it("returns short lists unchanged", () => {
-    assert.deepEqual(truncateList(["a", "b"], 5), ["a", "b"]);
+    assert.deepEqual(truncateList(["a", "b"], 5), { entries: ["a", "b"], omitted: 0 });
   });
 
-  it("caps long lists with a count marker", () => {
+  it("caps long lists without injecting a fake path entry", () => {
     const entries = Array.from({ length: 10 }, (_, i) => `entry${i}`);
     const result = truncateList(entries, 4);
-    assert.equal(result.length, 5);
-    assert.deepEqual(result.slice(0, 4), ["entry0", "entry1", "entry2", "entry3"]);
-    assert.equal(result[4], "... truncated 6 entries ...");
+    assert.deepEqual(result.entries, ["entry0", "entry1", "entry2", "entry3"]);
+    assert.equal(result.omitted, 6);
+  });
+
+  it("formatTruncatedList puts the marker as a trailing note", () => {
+    const entries = Array.from({ length: 10 }, (_, i) => `entry${i}`);
+    const text = formatTruncatedList(entries, 4);
+    assert.equal(text.split("\n").at(-1), "... truncated 6 entries ...");
+    assert.ok(!text.split("\n").slice(0, 4).some((line) => line.includes("truncated")));
   });
 });

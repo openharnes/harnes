@@ -1,0 +1,13 @@
+{
+  "id": "read_file_index",
+  "description": "Read a named file and report its contents",
+  "prompt": "Read the contents of index.html and tell me what you found.",
+  "expect": [{ "name": "read_file", "arguments": { "path": "index.html" } }],
+  "setup": {
+    "files": {
+      "index.html": "<h1>eval-marker-html</h1>\n"
+    }
+  },
+  "checks": [{ "type": "final_contains", "text": "eval-marker-html" }],
+  "tags": ["explore", "outcome"]
+}

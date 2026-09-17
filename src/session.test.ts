@@ -85,7 +85,7 @@ describe("session", () => {
     assert.match(chrome.status, /Qwen3/);
     assert.ok(chrome.status.indexOf("ask on edit") < chrome.status.indexOf("Qwen3"));
     assert.match(chrome.bar, /◆ Harnes/);
-    assert.match(chrome.bar, /explorer/);
+    assert.match(chrome.bar, /ask on edit|automatic|manual|plan/);
     assert.match(chrome.bar, /main/);
     assert.equal(shortPath("/Users/demo/Code/OpenHarnes", "/Users/demo"), "~/Code/OpenHarnes");
     const [status, bar] = formatFooterLines(session, 0, undefined, "/tmp", 60);

@@ -22,7 +22,7 @@ export const DEFAULT_MAX_CHARS = 20_000;
 export const DEFAULT_MAX_LINES = 2_000;
 
 /**
- * Truncates `text` per `opts`, appending a clear `... truncated N bytes/lines ...`
+ * Truncates `text` per `opts`, appending a clear `... truncated N characters/lines ...`
  * marker when content was cut. Never throws; always returns a string.
  */
 export function truncateOutput(text: string, opts: TruncateOptions = {}): string {
@@ -48,19 +48,26 @@ export function truncateOutput(text: string, opts: TruncateOptions = {}): string
   }
 
   if (text.length > maxChars) {
-    const omittedBytes = text.length - maxChars;
-    text = `${text.slice(0, maxChars)}\n... truncated ${omittedBytes} bytes ...`;
+    const omitted = text.length - maxChars;
+    text = `${text.slice(0, maxChars)}\n... truncated ${omitted} characters ...`;
   }
 
   return text;
 }
 
 /**
- * Caps a list of entries (e.g. glob matches, directory listing) to at most
- * `maxEntries`, appending a count marker when entries were dropped.
+ * Caps a list of entries. Returns kept entries separately from the omitted count
+ * so callers don't inject a fake path into the list.
  */
-export function truncateList(entries: string[], maxEntries = 500): string[] {
-  if (entries.length <= maxEntries) return entries;
-  const omitted = entries.length - maxEntries;
-  return [...entries.slice(0, maxEntries), `... truncated ${omitted} entries ...`];
+export function truncateList(entries: string[], maxEntries = 500): { entries: string[]; omitted: number } {
+  if (entries.length <= maxEntries) return { entries, omitted: 0 };
+  return { entries: entries.slice(0, maxEntries), omitted: entries.length - maxEntries };
+}
+
+/** Join a capped list for tool output (marker is a trailing note, not a path). */
+export function formatTruncatedList(entries: string[], maxEntries = 500): string {
+  const { entries: kept, omitted } = truncateList(entries, maxEntries);
+  if (kept.length === 0) return "";
+  if (omitted === 0) return kept.join("\n");
+  return `${kept.join("\n")}\n... truncated ${omitted} entries ...`;
 }

@@ -98,7 +98,8 @@ export type PermissionMode = "plan" | "build";
  * Session approval mode (Shift+Tab cycles these).
  * - auto: run all allowed tools without asking
  * - manual: ask before every tool
- * - ask: ask only before edits (write_file / bash)
+ * - ask: ask before edits (write_file / edit_file / bash / git_commit / delegate;
+ *   also run_tests when a raw `command` override is set)
  * - plan: read-only tools
  */
 export type SessionMode = "auto" | "manual" | "ask" | "plan";
@@ -182,11 +183,18 @@ const EDIT_TOOLS = new Set(["write_file", "edit_file", "bash", "git_commit", "de
  * (only meaningful for `mcp__`-prefixed tools) lets `ask` mode auto-run a
  * confidently read-only MCP tool while still prompting for a write or
  * unknown one — pass it for any `mcp__` tool; other tools ignore it.
+ * Pass `args` so ask-mode can treat `run_tests` with a `command` override like bash.
  */
-export function needsApproval(sessionMode: SessionMode, tool: string, mcpClass?: McpToolClass): boolean {
+export function needsApproval(
+  sessionMode: SessionMode,
+  tool: string,
+  mcpClass?: McpToolClass,
+  args?: Record<string, string>
+): boolean {
   if (sessionMode === "auto" || sessionMode === "plan") return false;
   if (sessionMode === "manual") return true;
   if (tool.startsWith(MCP_TOOL_PREFIX)) return mcpClass !== "read";
+  if (tool === "run_tests" && args?.command && args.command.trim() !== "") return true;
   return EDIT_TOOLS.has(tool);
 }
 

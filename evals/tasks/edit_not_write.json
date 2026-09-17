@@ -1,0 +1,15 @@
+{
+  "id": "edit_not_write",
+  "description": "Prefer edit_file; workspace must reflect the new description",
+  "prompt": "In package.json, change the description field to exactly eval-marker-description using edit_file (do not rewrite the whole file with write_file).",
+  "expect": [{ "name": "edit_file" }],
+  "setup": {
+    "files": {
+      "package.json": "{\n  \"name\": \"demo\",\n  \"version\": \"1.0.0\",\n  \"description\": \"old-description\"\n}\n"
+    }
+  },
+  "checks": [
+    { "type": "file_contains", "path": "package.json", "text": "eval-marker-description" }
+  ],
+  "tags": ["edit", "outcome"]
+}

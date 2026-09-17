@@ -26,13 +26,23 @@ function cachePath(override?: string): string {
 }
 
 function compareSemver(a: string, b: string): number {
-  const pa = a.replace(/^v/, "").split(".").map((n) => Number.parseInt(n, 10) || 0);
-  const pb = b.replace(/^v/, "").split(".").map((n) => Number.parseInt(n, 10) || 0);
+  const parse = (v: string) => {
+    const cleaned = v.replace(/^v/, "");
+    const [core, pre = ""] = cleaned.split("-", 2);
+    const parts = core.split(".").map((n) => Number.parseInt(n, 10) || 0);
+    return { parts, pre };
+  };
+  const pa = parse(a);
+  const pb = parse(b);
   for (let i = 0; i < 3; i += 1) {
-    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    const d = (pa.parts[i] ?? 0) - (pb.parts[i] ?? 0);
     if (d !== 0) return d;
   }
-  return 0;
+  // No prerelease > any prerelease (1.0.0 > 1.0.0-rc.1)
+  if (!pa.pre && pb.pre) return 1;
+  if (pa.pre && !pb.pre) return -1;
+  if (pa.pre === pb.pre) return 0;
+  return pa.pre < pb.pre ? -1 : 1;
 }
 
 async function readCache(path: string): Promise<CacheFile> {
@@ -44,21 +54,32 @@ async function readCache(path: string): Promise<CacheFile> {
 }
 
 async function writeCache(path: string, latest: string, checkedAt: number): Promise<void> {
-  const { dirname } = await import("node:path");
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${JSON.stringify({ latest, checkedAt }, null, 2)}\n`, "utf8");
+  const { dirname, join: pathJoin } = await import("node:path");
+  const { rename } = await import("node:fs/promises");
+  const dir = dirname(path);
+  await mkdir(dir, { recursive: true });
+  const tmp = pathJoin(dir, `.update.${process.pid}.${Date.now()}.tmp`);
+  await writeFile(tmp, `${JSON.stringify({ latest, checkedAt }, null, 2)}\n`, "utf8");
+  await rename(tmp, path);
 }
 
 export async function fetchLatestVersion(fetchImpl: typeof fetch = fetch): Promise<string> {
-  const response = await fetchImpl(REGISTRY_URL, {
-    headers: { Accept: "application/json" },
-  });
-  if (!response.ok) {
-    throw new Error(`npm registry failed (${response.status})`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const response = await fetchImpl(REGISTRY_URL, {
+      headers: { Accept: "application/json" },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`npm registry failed (${response.status})`);
+    }
+    const json = (await response.json()) as { version?: string };
+    if (!json.version) throw new Error("npm registry response missing version");
+    return json.version;
+  } finally {
+    clearTimeout(timer);
   }
-  const json = (await response.json()) as { version?: string };
-  if (!json.version) throw new Error("npm registry response missing version");
-  return json.version;
 }
 
 /**
@@ -98,6 +119,20 @@ export function applyUpdate(): Promise<{ ok: boolean; output: string }> {
       env: process.env,
     });
     let output = "";
+    let settled = false;
+    const finish = (ok: boolean, text: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ ok, output: text.trim() });
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      setTimeout(() => {
+        if (!child.killed) child.kill("SIGKILL");
+      }, 2_000);
+      finish(false, output + "\n(npm install timed out after 120s)");
+    }, 120_000);
     child.stdout?.on("data", (chunk: Buffer) => {
       output += chunk.toString();
     });
@@ -105,10 +140,10 @@ export function applyUpdate(): Promise<{ ok: boolean; output: string }> {
       output += chunk.toString();
     });
     child.on("error", (error) => {
-      resolve({ ok: false, output: error.message });
+      finish(false, error.message);
     });
     child.on("close", (code) => {
-      resolve({ ok: code === 0, output: output.trim() });
+      finish(code === 0, output);
     });
   });
 }

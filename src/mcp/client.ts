@@ -22,7 +22,7 @@ export interface McpToolDef {
 
 interface JsonRpcRequest {
   jsonrpc: "2.0";
-  id: number;
+  id: number | string;
   method: string;
   params?: unknown;
 }
@@ -35,13 +35,15 @@ interface JsonRpcNotification {
 
 interface JsonRpcResponse {
   jsonrpc: "2.0";
-  id?: number;
+  id?: number | string;
   result?: unknown;
   error?: { code: number; message: string; data?: unknown };
 }
 
+import { HARNES_VERSION } from "../version.ts";
+
 const CLIENT_NAME = "harnes";
-const CLIENT_VERSION = "0.2.3";
+const CLIENT_VERSION = HARNES_VERSION;
 const PROTOCOL_VERSION = "2024-11-05";
 const DEFAULT_TIMEOUT_MS = 10_000;
 
@@ -55,17 +57,23 @@ export class McpStdioClient {
   private child: ChildProcessWithoutNullStreams | undefined;
   private buffer = "";
   private nextId = 1;
-  private readonly pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
+  private readonly pending = new Map<number | string, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
   private closed = false;
+  private recentStderr = "";
 
   constructor(
     private readonly name: string,
     private readonly config: McpServerConfig
   ) {}
 
+  /** True when the stdio child is still running. */
+  get alive(): boolean {
+    return Boolean(this.child && !this.child.killed && this.child.exitCode === null);
+  }
+
   /** Spawns the server process and completes the `initialize` handshake. Throws on failure; never crashes the caller. */
   async connect(timeoutMs = DEFAULT_TIMEOUT_MS): Promise<void> {
-    if (this.child) return;
+    if (this.child && this.alive) return;
     if (!this.config.command || this.config.command.trim() === "") {
       throw new Error(`MCP server '${this.name}' has no "command" configured.`);
     }
@@ -75,20 +83,26 @@ export class McpStdioClient {
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.child = child;
+    this.closed = false;
 
     child.on("error", (error) => {
       this.failAllPending(error instanceof Error ? error : new Error(String(error)));
+      this.child = undefined;
     });
     child.on("exit", (code, signal) => {
       if (!this.closed) {
+        const stderrHint = this.recentStderr.trim() ? ` stderr: ${this.recentStderr.trim().slice(0, 400)}` : "";
         this.failAllPending(
-          new Error(`MCP server '${this.name}' exited (code ${code ?? "null"}, signal ${signal ?? "null"}) before responding.`)
+          new Error(
+            `MCP server '${this.name}' exited (code ${code ?? "null"}, signal ${signal ?? "null"}) before responding.${stderrHint}`
+          )
         );
       }
+      this.child = undefined;
     });
     child.stdout.on("data", (chunk: Buffer) => this.onData(chunk));
-    child.stderr.on("data", () => {
-      /* server stderr is not part of the protocol; surfaced only via thrown error messages */
+    child.stderr.on("data", (chunk: Buffer) => {
+      this.recentStderr = `${this.recentStderr}${chunk.toString("utf8")}`.slice(-2_000);
     });
 
     try {
@@ -153,7 +167,7 @@ export class McpStdioClient {
     } catch {
       return; // ignore stray non-JSON stdout noise
     }
-    if (typeof message.id !== "number") return; // server notification; unused in the MVP
+    if (typeof message.id !== "number" && typeof message.id !== "string") return; // server notification; unused in the MVP
     const waiter = this.pending.get(message.id);
     if (!waiter) return;
     this.pending.delete(message.id);

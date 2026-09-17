@@ -1,9 +1,10 @@
 import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { promisify } from "node:util";
 import type { CheckResult, CheckRunOptions, CommandResult, ExecutionBackend, ReadFileOptions } from "./types.ts";
-import { truncateList, truncateOutput } from "./output.ts";
+import { formatTruncatedList, truncateOutput } from "./output.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -69,6 +70,11 @@ async function walk(root: string, dir: string, onFile: (relativePath: string) =>
   for (const entry of entries) {
     if (entry.isDirectory() && SKIP_DIRS.has(entry.name)) continue;
     const absolute = path.join(dir, entry.name);
+    if (entry.isSymbolicLink()) {
+      // Surface in-root symlinks as files; do not follow (avoids cycles / escapes).
+      onFile(path.relative(root, absolute).split(path.sep).join("/"));
+      continue;
+    }
     if (entry.isDirectory()) {
       await walk(root, absolute, onFile);
     } else if (entry.isFile()) {
@@ -83,14 +89,29 @@ export class LocalBackend implements ExecutionBackend {
   constructor(private readonly root: string) {}
 
   async run(command: string, cwd = this.root): Promise<CommandResult> {
+    let runCwd = this.root;
+    if (cwd !== this.root) {
+      // Sandbox: never allow a cwd outside the workspace root.
+      const rel = path.isAbsolute(cwd) ? path.relative(this.root, cwd) : cwd;
+      runCwd = this.resolveWithinRoot(rel === "" ? "." : rel);
+    }
     try {
       const { stdout, stderr } = await execFileAsync("bash", ["-lc", command], {
-        cwd,
+        cwd: runCwd,
         maxBuffer: 8 * 1024 * 1024,
+        timeout: 120_000,
+        killSignal: "SIGTERM",
       });
       return { exitCode: 0, stdout: capBashOutput(stdout), stderr: capBashOutput(stderr) };
     } catch (error) {
-      const failed = error as { stdout?: string; stderr?: string; code?: number };
+      const failed = error as { stdout?: string; stderr?: string; code?: number; killed?: boolean; signal?: string };
+      if (failed.killed || failed.signal === "SIGTERM") {
+        return {
+          exitCode: 124,
+          stdout: capBashOutput(failed.stdout ?? ""),
+          stderr: capBashOutput((failed.stderr ?? "") + "\n(command timed out after 120s)"),
+        };
+      }
       return {
         exitCode: typeof failed.code === "number" ? failed.code : 1,
         stdout: capBashOutput(failed.stdout ?? ""),
@@ -175,7 +196,8 @@ export class LocalBackend implements ExecutionBackend {
       if (matcher.test(relativePath)) matches.push(relativePath);
     });
     matches.sort();
-    return truncateList(matches, MAX_LIST_ENTRIES);
+    const formatted = formatTruncatedList(matches, MAX_LIST_ENTRIES);
+    return formatted ? formatted.split("\n") : [];
   }
 
   async grep(pattern: string, searchPath?: string, glob?: string): Promise<string> {
@@ -189,12 +211,22 @@ export class LocalBackend implements ExecutionBackend {
     }
 
     const files: string[] = [];
-    await walk(this.root, searchRoot, (relativePath) => {
-      if (!fileMatcher || fileMatcher.test(relativePath) || fileMatcher.test(path.basename(relativePath))) {
-        files.push(relativePath);
-      }
-    });
-    files.sort();
+    let isFileTarget = false;
+    try {
+      isFileTarget = statSync(searchRoot).isFile();
+    } catch {
+      isFileTarget = false;
+    }
+    if (isFileTarget) {
+      files.push(path.relative(this.root, searchRoot).split(path.sep).join("/") || path.basename(searchRoot));
+    } else {
+      await walk(this.root, searchRoot, (relativePath) => {
+        if (!fileMatcher || fileMatcher.test(relativePath) || fileMatcher.test(path.basename(relativePath))) {
+          files.push(relativePath);
+        }
+      });
+      files.sort();
+    }
 
     const lines: string[] = [];
     let size = 0;
@@ -220,17 +252,28 @@ export class LocalBackend implements ExecutionBackend {
     }
     if (lines.length === 0) return "No matches.";
     const joined = lines.join("\n");
-    return truncated ? `${joined}\n... truncated (result cap reached) ...` : joined;
+    return truncated
+      ? truncateOutput(`${joined}\n`, { maxChars: MAX_OUTPUT_CHARS })
+      : joined;
   }
 
   async listDir(dirPath?: string): Promise<string[]> {
     const resolved = this.resolveWithinRoot(dirPath ?? ".");
-    const entries = await readdir(resolved, { withFileTypes: true });
+    let entries;
+    try {
+      entries = await readdir(resolved, { withFileTypes: true });
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") throw new Error(`Directory not found: ${dirPath ?? "."}`);
+      if (code === "ENOTDIR") throw new Error(`Not a directory: ${dirPath ?? "."}`);
+      throw error;
+    }
     const names = entries
       .filter((entry) => !(entry.isDirectory() && SKIP_DIRS.has(entry.name)))
       .map((entry) => (entry.isDirectory() ? `${entry.name}/` : entry.name))
       .sort();
-    return truncateList(names, MAX_LIST_ENTRIES);
+    const formatted = formatTruncatedList(names, MAX_LIST_ENTRIES);
+    return formatted ? formatted.split("\n") : [];
   }
 
   async gitStatus(): Promise<string> {
@@ -239,8 +282,12 @@ export class LocalBackend implements ExecutionBackend {
   }
 
   async gitDiff(filePath?: string): Promise<string> {
-    const args = ["diff"];
-    if (filePath) args.push("--", filePath);
+    // Include both unstaged and staged changes (plain `git diff` hides the index).
+    const args = ["diff", "HEAD"];
+    if (filePath) {
+      const rel = this.resolveWithinRoot(filePath);
+      args.push("--", path.relative(this.root, rel) || ".");
+    }
     const { stdout } = await this.runGit(args);
     return capBashOutput(stdout.trim() === "" ? "(no changes)" : stdout);
   }
@@ -333,13 +380,36 @@ export class LocalBackend implements ExecutionBackend {
     return;
   }
 
-  /** Resolves a path and ensures it stays within the backend root. */
+  /** Resolves a path and ensures it stays within the backend root (rejects symlink escapes). */
   private resolveWithinRoot(filePath: string): string {
     const resolved = path.resolve(this.root, filePath);
     const rootResolved = path.resolve(this.root);
     const rootWithSep = rootResolved.endsWith(path.sep) ? rootResolved : `${rootResolved}${path.sep}`;
     if (resolved !== rootResolved && !resolved.startsWith(rootWithSep)) {
       throw new Error(`Path escapes workspace root: ${filePath}`);
+    }
+    // If the path (or a symlink parent) already exists, reject escapes via realpath.
+    try {
+      const realRoot = existsSync(rootResolved) ? realpathSync(rootResolved) : rootResolved;
+      const probe = existsSync(resolved)
+        ? realpathSync(resolved)
+        : (() => {
+            let dir = path.dirname(resolved);
+            while (dir !== path.dirname(dir)) {
+              if (existsSync(dir)) return path.join(realpathSync(dir), path.relative(dir, resolved));
+              dir = path.dirname(dir);
+            }
+            return resolved;
+          })();
+      const realRootSep = realRoot.endsWith(path.sep) ? realRoot : `${realRoot}${path.sep}`;
+      if (probe !== realRoot && !probe.startsWith(realRootSep)) {
+        throw new Error(`Path escapes workspace root: ${filePath}`);
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("Path escapes")) throw error;
+      throw new Error(
+        `Path could not be verified inside workspace root: ${filePath} (${error instanceof Error ? error.message : String(error)})`
+      );
     }
     return resolved;
   }

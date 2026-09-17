@@ -1,0 +1,13 @@
+{
+  "id": "grep_pattern",
+  "description": "Search code with grep and report the hit",
+  "prompt": "Search the workspace for the string AGENT_TOOLS using grep, then tell me which file matched.",
+  "expect": [{ "name": "grep" }],
+  "setup": {
+    "files": {
+      "src/loop.ts": "export const AGENT_TOOLS = [];\n"
+    }
+  },
+  "checks": [{ "type": "final_matches", "pattern": "AGENT_TOOLS|loop\\.ts" }],
+  "tags": ["explore", "outcome"]
+}

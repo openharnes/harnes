@@ -10,12 +10,16 @@ export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
   tool_call_id?: string;
+  /** Present on assistant messages that requested tools (required for multi-turn API history). */
+  tool_calls?: ToolCall[];
 }
 
 export interface ToolCall {
   id: string;
   name: string;
   arguments: Record<string, string>;
+  /** Original JSON values (numbers/booleans/objects) — used for MCP tools/call. */
+  typedArguments?: Record<string, unknown>;
 }
 
 export interface CompletionResult {
@@ -28,16 +32,18 @@ export interface CompletionClient {
   complete(input: {
     model: string;
     messages: ChatMessage[];
-    tools: { name: string; description: string }[];
+    tools: { name: string; description: string; parameters?: Record<string, unknown> }[];
     /** When "required", the model must emit at least one tool call (OpenAI/OpenRouter). */
     toolChoice?: "auto" | "required" | "none";
+    /** Cancel in-flight HTTP when the REPL aborts (Ctrl+C). */
+    signal?: AbortSignal;
   }): Promise<CompletionResult>;
 }
 
 export interface LoopResult {
   messages: ChatMessage[];
   steps: number;
-  stoppedReason: "complete" | "max-steps" | "denied-tool";
+  stoppedReason: "complete" | "max-steps" | "denied-tool" | "aborted";
   usage: CompletionUsage;
   /** Final todo list state after this turn (see `todos` input option). */
   todos: TodoItem[];
@@ -50,13 +56,16 @@ export type LoopProgress =
 
 /**
  * Tools that must not run concurrently with siblings in the same step.
- * When any call in a step names a tool from this set, the whole step falls
- * back to serial execution (in model call order) rather than mixing modes.
- * Empty today; a future tool with cross-call side effects (e.g. one that
- * depends on another tool's output within the same step) should be added
- * here instead of special-casing the scheduler.
+ * Mutating / shared-state tools serialize the whole step when present.
  */
-const SERIAL_ONLY_TOOLS = new Set<string>([]);
+const SERIAL_ONLY_TOOLS = new Set<string>([
+  "write_file",
+  "edit_file",
+  "todo_write",
+  "git_commit",
+  "run_tests",
+  "delegate",
+]);
 
 /** Max number of tool calls from a single step executed concurrently. */
 const TOOL_CONCURRENCY_LIMIT = 6;
@@ -90,7 +99,8 @@ async function runWithConcurrencyLimit<T>(tasks: Array<() => Promise<T>>, limit:
   return results;
 }
 
-const TOOLS = [
+/** Tool schemas advertised to the model (also used by `harnes eval`). */
+export const AGENT_TOOLS = [
   {
     name: "read_file",
     description:
@@ -157,7 +167,128 @@ const TOOLS = [
     description:
       'Load an on-demand markdown skill file into context, or list what\'s available. Skills live in .harnes/skills/ (workspace) and ~/.config/harnes/skills/ (user-level); a workspace skill shadows a same-named user skill. Call with no `name` to list available skills; call with `name` set to load that skill\'s body (capped at 8,000 characters, truncated with a marker if longer). Read-only, allowed in plan mode.',
   },
-];
+] as const;
+
+/** JSON Schema parameters per tool — without these, models guess arg names and types. */
+export const AGENT_TOOL_PARAMETERS: Record<string, Record<string, unknown>> = {
+  read_file: {
+    type: "object",
+    properties: {
+      path: { type: "string", description: "Path relative to workspace root" },
+      offset: { type: "string", description: "1-based start line (optional)" },
+      limit: { type: "string", description: "Max lines to return (optional)" },
+    },
+    required: ["path"],
+    additionalProperties: false,
+  },
+  write_file: {
+    type: "object",
+    properties: {
+      path: { type: "string" },
+      contents: { type: "string" },
+    },
+    required: ["path", "contents"],
+    additionalProperties: false,
+  },
+  edit_file: {
+    type: "object",
+    properties: {
+      path: { type: "string" },
+      old_string: { type: "string" },
+      new_string: { type: "string" },
+      replace_all: { type: "string", description: 'Set "true" to replace every match' },
+    },
+    required: ["path", "old_string", "new_string"],
+    additionalProperties: false,
+  },
+  bash: {
+    type: "object",
+    properties: { command: { type: "string" } },
+    required: ["command"],
+    additionalProperties: false,
+  },
+  glob: {
+    type: "object",
+    properties: { pattern: { type: "string", description: "Glob pattern, e.g. **/*.ts" } },
+    required: ["pattern"],
+    additionalProperties: false,
+  },
+  grep: {
+    type: "object",
+    properties: {
+      pattern: { type: "string", description: "Regex pattern" },
+      path: { type: "string", description: "Optional directory/file scope" },
+      glob: { type: "string", description: "Optional filename glob filter" },
+    },
+    required: ["pattern"],
+    additionalProperties: false,
+  },
+  list_dir: {
+    type: "object",
+    properties: { path: { type: "string", description: "Directory path (default .)" } },
+    additionalProperties: false,
+  },
+  todo_write: {
+    type: "object",
+    properties: {
+      items: {
+        type: "string",
+        description: 'JSON array of {"id","content","status"} objects',
+      },
+    },
+    required: ["items"],
+    additionalProperties: false,
+  },
+  git_status: { type: "object", properties: {}, additionalProperties: false },
+  git_diff: {
+    type: "object",
+    properties: { path: { type: "string" } },
+    additionalProperties: false,
+  },
+  git_log: {
+    type: "object",
+    properties: { max_count: { type: "string", description: "Max commits (default 20)" } },
+    additionalProperties: false,
+  },
+  git_commit: {
+    type: "object",
+    properties: {
+      message: { type: "string" },
+      stage_all: { type: "string", description: 'Pass "false" to skip git add -A' },
+    },
+    required: ["message"],
+    additionalProperties: false,
+  },
+  run_tests: {
+    type: "object",
+    properties: {
+      script: { type: "string", description: "package.json script name (default test)" },
+      command: { type: "string", description: "Explicit shell command override" },
+    },
+    additionalProperties: false,
+  },
+  delegate: {
+    type: "object",
+    properties: {
+      task: { type: "string" },
+      mode: { type: "string", description: 'plan (default) or build' },
+      model: { type: "string", description: 'Only "inherit" supported' },
+    },
+    required: ["task"],
+    additionalProperties: false,
+  },
+  skill: {
+    type: "object",
+    properties: { name: { type: "string", description: "Skill name; omit to list" } },
+    additionalProperties: false,
+  },
+};
+
+const TOOLS: { name: string; description: string; parameters?: Record<string, unknown> }[] = AGENT_TOOLS.map((tool) => ({
+  name: tool.name,
+  description: tool.description,
+  parameters: AGENT_TOOL_PARAMETERS[tool.name],
+}));
 
 function emptyUsage(): CompletionUsage {
   return { promptTokens: 0, completionTokens: 0, totalTokens: 0, costUsd: 0 };
@@ -214,6 +345,8 @@ export async function runAgentLoop(opts: {
   cwd?: string;
   /** preToolUse/postToolUse hook definitions from config (see src/hooks.ts). Omitted = no config-defined hooks. */
   hooks?: HooksConfig;
+  /** When aborted, the loop stops between steps (REPL Ctrl+C). */
+  signal?: AbortSignal;
 }): Promise<LoopResult> {
   const maxSteps = opts.maxSteps ?? 24;
   const subagentDepth = opts.subagentDepth ?? 0;
@@ -236,16 +369,27 @@ export async function runAgentLoop(opts: {
   let forceTools = false;
 
   for (let step = 0; step < maxSteps; step += 1) {
+    if (opts.signal?.aborted) {
+      return { messages, steps: step, stoppedReason: "aborted", usage, todos };
+    }
     opts.onProgress?.({ type: "thinking", step: step + 1 });
     const reply = await opts.complete({
       model: opts.model.providerModel,
       messages,
       tools,
       toolChoice: forceTools ? "required" : "auto",
+      signal: opts.signal,
     });
+    if (opts.signal?.aborted) {
+      return { messages, steps: step + 1, stoppedReason: "aborted", usage, todos };
+    }
     forceTools = false;
     addUsage(usage, reply.usage);
-    messages.push({ role: "assistant", content: reply.content });
+    messages.push({
+      role: "assistant",
+      content: reply.content,
+      ...(reply.toolCalls.length > 0 ? { tool_calls: reply.toolCalls } : {}),
+    });
 
     if (reply.toolCalls.length === 0) {
       // Weak models often narrate "Let me check…" / ask for "ok" and stop with
@@ -274,21 +418,31 @@ export async function runAgentLoop(opts: {
         ? Boolean(opts.mcp) && mcpToolAllowed(opts.permissionMode, opts.mcp!.classify(call.name))
         : isToolAllowed(opts.permissionMode, call.name);
       if (!allowed) {
-        resolved.push({ call, denied: `Tool ${call.name} is not available in ${opts.permissionMode} mode.` });
+        resolved.push({
+          call,
+          denied: `Tool ${call.name} is not available in ${opts.permissionMode} mode. Pick an allowed tool and continue.`,
+        });
         continue;
       }
       if (opts.onApprove && !(await opts.onApprove(call))) {
-        resolved.push({ call, denied: `User denied tool ${call.name}.` });
+        resolved.push({
+          call,
+          denied: `User denied tool ${call.name}. Choose a different approach or ask the user what to do next.`,
+        });
         continue;
       }
       resolved.push({ call });
     }
 
     const runnable = resolved.filter((entry) => !entry.denied);
+    if (opts.signal?.aborted) {
+      return { messages, steps: step + 1, stoppedReason: "aborted", usage, todos };
+    }
     const forceSerial = runnable.some((entry) => SERIAL_ONLY_TOOLS.has(entry.call.name));
     const concurrency = forceSerial ? 1 : TOOL_CONCURRENCY_LIMIT;
     const results = await runWithConcurrencyLimit(
       runnable.map((entry) => async () => {
+        if (opts.signal?.aborted) return "Tool error: aborted.";
         opts.onProgress?.({ type: "tool", step: step + 1, name: entry.call.name });
         return await executeTool(
           opts.backend,
@@ -303,6 +457,9 @@ export async function runAgentLoop(opts: {
             timeoutMs: opts.subagentTimeoutMs,
             cwd: opts.cwd ?? process.cwd(),
             hooks: opts.hooks,
+            signal: opts.signal,
+            onApprove: opts.onApprove,
+            mcp: opts.mcp,
           },
           opts.mcp
         );
@@ -312,20 +469,15 @@ export async function runAgentLoop(opts: {
 
     // Rebuild the transcript in original model call order (not completion order).
     let runnableIndex = 0;
-    let anyDenied = false;
     for (const entry of resolved) {
       if (entry.denied) {
-        anyDenied = true;
         messages.push({ role: "tool", tool_call_id: entry.call.id, content: entry.denied });
       } else {
         messages.push({ role: "tool", tool_call_id: entry.call.id, content: results[runnableIndex] });
         runnableIndex += 1;
       }
     }
-
-    if (anyDenied) {
-      return { messages, steps: step + 1, stoppedReason: "denied-tool", usage, todos };
-    }
+    // Denials are recoverable: feed the denial text back and let the model continue.
   }
 
   return { messages, steps: maxSteps, stoppedReason: "max-steps", usage, todos };
@@ -374,7 +526,7 @@ function systemPrompt(mode: PermissionMode, exec: string): string {
 /** Max times we inject a continue nudge when the model stalls with no tool calls. */
 const MAX_AUTO_CONTINUES = 8;
 
-const CONTINUE_NUDGE =
+export const CONTINUE_NUDGE =
   'Stop narrating. Emit the tool call(s) for the next concrete action NOW (list_dir / read_file / bash / etc). Do not write another "Let me…" / "I\'ll check…" sentence and do not ask for ok/sure/confirmation. Keep going until the user\'s request is fully done.';
 
 /**
@@ -387,6 +539,14 @@ export function shouldAutoContinue(content: string): boolean {
   // Closing / finished answers — leave the turn alone.
   if (
     /\b(let me know if|if you need (anything|more)|hope (that|this) helps|you('re| are) all set|already running|server is (up|running)|created successfully|here('s| is) (the|what)|fixed\.|done\.|complete\.)\b/i.test(
+      text
+    )
+  ) {
+    return false;
+  }
+  // Explanatory prose ("First, let me explain…") is not a stall — don't force tools.
+  if (
+    /\b(let me (explain|clarify|summarize|outline|describe|walk (you )?through)|i('ll| will) (explain|clarify|summarize)|here('s| is) (how|why|what))\b/i.test(
       text
     )
   ) {
@@ -422,6 +582,9 @@ interface SubagentContext {
   cwd: string;
   /** preToolUse/postToolUse hook definitions from config, threaded down to a `delegate` child loop too. */
   hooks?: HooksConfig;
+  mcp?: McpToolProvider;
+  signal?: AbortSignal;
+  onApprove?: (call: ToolCall) => Promise<boolean>;
 }
 
 async function executeTool(
@@ -455,41 +618,58 @@ async function dispatchTool(
   try {
     if (call.name.startsWith(MCP_TOOL_PREFIX)) {
       if (!mcp) return "Tool error: no MCP servers are configured.";
-      return await mcp.callTool(call.name, call.arguments);
+      return await mcp.callTool(call.name, call.typedArguments ?? call.arguments);
     }
     if (call.name === "read_file") {
+      const filePath = (call.arguments.path ?? "").trim();
+      if (!filePath) return "Tool error: read_file requires a non-empty path.";
       const offset = parsePositiveInt(call.arguments.offset);
       const limit = parsePositiveInt(call.arguments.limit);
       const hasOptions = offset !== undefined || limit !== undefined;
-      return await backend.readFile(call.arguments.path ?? "", hasOptions ? { offset, limit } : undefined);
+      return await backend.readFile(filePath, hasOptions ? { offset, limit } : undefined);
     }
     if (call.name === "write_file") {
-      await backend.writeFile(call.arguments.path ?? "", call.arguments.contents ?? "");
-      return `Wrote ${call.arguments.path}`;
+      const filePath = (call.arguments.path ?? "").trim();
+      if (!filePath) return "Tool error: write_file requires a non-empty path.";
+      await backend.writeFile(filePath, call.arguments.contents ?? "");
+      return `Wrote ${filePath}`;
     }
     if (call.name === "edit_file") {
-      const replaceAll = call.arguments.replace_all === "true" || call.arguments.replace_all === "1";
+      const filePath = (call.arguments.path ?? "").trim();
+      if (!filePath) return "Tool error: edit_file requires a non-empty path.";
+      const replaceAll = parseTruthy(call.arguments.replace_all);
       const result = await backend.editFile(
-        call.arguments.path ?? "",
+        filePath,
         call.arguments.old_string ?? "",
         call.arguments.new_string ?? "",
         replaceAll
       );
-      return `Edited ${call.arguments.path} (${result.replacements} replacement${result.replacements === 1 ? "" : "s"})`;
+      return `Edited ${filePath} (${result.replacements} replacement${result.replacements === 1 ? "" : "s"})`;
     }
     if (call.name === "bash") {
-      const result = await backend.run(call.arguments.command ?? "");
-      return `exit ${result.exitCode}\n${result.stdout}${result.stderr}`;
+      const command = (call.arguments.command ?? "").trim();
+      if (!command) return "Tool error: bash requires a non-empty command.";
+      const result = await backend.run(command);
+      const stderr = result.stderr ? `\nstderr:\n${result.stderr}` : "";
+      return `exit ${result.exitCode}\n${result.stdout}${stderr}`;
     }
     if (call.name === "glob") {
-      const matches = await backend.glob(call.arguments.pattern ?? "**");
+      const pattern = (call.arguments.pattern ?? "").trim();
+      if (!pattern) return "Tool error: glob requires a non-empty pattern.";
+      const matches = await backend.glob(pattern);
       return matches.length > 0 ? matches.join("\n") : "No matches.";
     }
     if (call.name === "grep") {
-      return await backend.grep(call.arguments.pattern ?? "", call.arguments.path, call.arguments.glob);
+      const pattern = call.arguments.pattern ?? "";
+      if (!pattern.trim()) return "Tool error: grep requires a non-empty pattern.";
+      return await backend.grep(pattern, call.arguments.path, call.arguments.glob);
     }
     if (call.name === "list_dir") {
-      const entries = await backend.listDir(call.arguments.path);
+      const dirPath = call.arguments.path;
+      if (dirPath !== undefined && dirPath.trim() === "") {
+        return "Tool error: list_dir path must not be an empty string (omit path for cwd, or pass '.').";
+      }
+      const entries = await backend.listDir(dirPath);
       return entries.length > 0 ? entries.join("\n") : "(empty directory)";
     }
     if (call.name === "todo_write") {
@@ -508,7 +688,7 @@ async function dispatchTool(
       return await backend.gitLog(maxCount);
     }
     if (call.name === "git_commit") {
-      const stageAll = call.arguments.stage_all !== "false" && call.arguments.stage_all !== "0";
+      const stageAll = !parseFalsy(call.arguments.stage_all);
       const result = await backend.gitCommit(call.arguments.message ?? "", { stageAll });
       return `Committed ${result.commit}${result.summary ? `\n${result.summary}` : ""}`;
     }
@@ -591,6 +771,10 @@ async function runDelegate(backend: ExecutionBackend, call: ToolCall, subagent: 
     close: () => backend.close(),
   };
 
+  const childAbort = new AbortController();
+  const onParentAbort = () => childAbort.abort();
+  subagent.signal?.addEventListener("abort", onParentAbort, { once: true });
+
   const childLoop = runAgentLoop({
     prompt: task,
     model: subagent.model,
@@ -601,6 +785,9 @@ async function runDelegate(backend: ExecutionBackend, call: ToolCall, subagent: 
     subagentDepth: subagent.depth + 1,
     cwd: subagent.cwd,
     hooks: subagent.hooks,
+    signal: childAbort.signal,
+    onApprove: subagent.onApprove,
+    mcp: subagent.mcp,
   });
 
   const timeoutMs = subagent.timeoutMs ?? SUBAGENT_TIMEOUT_MS;
@@ -610,7 +797,10 @@ async function runDelegate(backend: ExecutionBackend, call: ToolCall, subagent: 
     new Promise<typeof timedOut>((resolve) => setTimeout(() => resolve(timedOut), timeoutMs)),
   ]);
 
+  subagent.signal?.removeEventListener("abort", onParentAbort);
+
   if (outcome === timedOut) {
+    childAbort.abort();
     return `Subagent timed out after ${Math.round(timeoutMs / 1000)}s in ${childPermissionMode} mode${modelNote}. Any partial work it did is not reflected here — check git_status/git_diff if it may have written files.`;
   }
 
@@ -618,12 +808,16 @@ async function runDelegate(backend: ExecutionBackend, call: ToolCall, subagent: 
   const lastAssistant = [...result.messages].reverse().find((message) => message.role === "assistant" && message.content);
   const summary = lastAssistant?.content?.trim() || "(subagent produced no final message)";
   const fileList = touched.length > 0 ? touched.map((file) => `- ${file}`).join("\n") : "(no files touched)";
+  const usageNote =
+    result.usage.costUsd || result.usage.totalTokens
+      ? `\n(usage: ${result.usage.promptTokens} in / ${result.usage.completionTokens} out${result.usage.costUsd ? ` · $${result.usage.costUsd.toFixed(4)}` : ""})`
+      : "";
   return [
     `Subagent done (${childPermissionMode} mode, ${result.steps} step${result.steps === 1 ? "" : "s"}, ${result.stoppedReason}${modelNote}):`,
     summary,
     "",
     "Files touched:",
-    fileList,
+    fileList + usageNote,
   ].join("\n");
 }
 
@@ -633,6 +827,9 @@ export async function openaiCompatibleComplete(
   input: Parameters<CompletionClient["complete"]>[0],
   fetchImpl: typeof fetch = fetch
 ): Promise<CompletionResult> {
+  if (input.signal?.aborted) {
+    throw new Error("Model request aborted.");
+  }
   const response = await fetchImpl(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
     headers: {
@@ -643,16 +840,40 @@ export async function openaiCompatibleComplete(
     },
     body: JSON.stringify({
       model: input.model,
-      messages: input.messages,
+      messages: input.messages.map((message) => {
+        if (message.role === "assistant" && message.tool_calls?.length) {
+          return {
+            role: "assistant",
+            content: message.content || null,
+            tool_calls: message.tool_calls.map((call) => ({
+              id: call.id,
+              type: "function",
+              function: { name: call.name, arguments: JSON.stringify(call.arguments ?? {}) },
+            })),
+          };
+        }
+        if (message.role === "tool") {
+          return { role: "tool", tool_call_id: message.tool_call_id, content: message.content };
+        }
+        return { role: message.role, content: message.content };
+      }),
       tools: input.tools.map((tool) => ({
         type: "function",
-        function: { name: tool.name, description: tool.description, parameters: { type: "object", additionalProperties: true } },
+        function: {
+          name: tool.name,
+          description: tool.description,
+          parameters: tool.parameters ?? { type: "object", additionalProperties: true },
+        },
       })),
       ...(input.toolChoice ? { tool_choice: input.toolChoice } : {}),
       // OpenRouter returns usage.cost when this is set / by default for non-streaming.
       usage: { include: true },
     }),
+    signal: input.signal,
   });
+  if (input.signal?.aborted) {
+    throw new Error("Model request aborted.");
+  }
   if (!response.ok) {
     throw new Error(`Model endpoint failed (${response.status}): ${await response.text()}`);
   }
@@ -664,14 +885,25 @@ export async function openaiCompatibleComplete(
       };
     }>;
     usage?: unknown;
+    error?: { message?: string };
   };
-  const message = json.choices?.[0]?.message;
+  if (json.error?.message) {
+    throw new Error(`Model endpoint error: ${json.error.message}`);
+  }
+  if (!json.choices?.length) {
+    throw new Error("Model endpoint returned no choices (empty response).");
+  }
+  const message = json.choices[0]?.message;
   const toolCalls: ToolCall[] =
-    message?.tool_calls?.map((call) => ({
-      id: call.id,
-      name: call.function.name,
-      arguments: safeJson(call.function.arguments),
-    })) ?? [];
+    message?.tool_calls?.map((call) => {
+      const typed = parseTypedToolArguments(call.function.arguments);
+      return {
+        id: call.id,
+        name: call.function.name,
+        arguments: coerceToolArguments(call.function.arguments),
+        typedArguments: typed,
+      };
+    }) ?? [];
   return {
     content: message?.content ?? "",
     toolCalls,
@@ -681,15 +913,54 @@ export async function openaiCompatibleComplete(
 
 /** Parses a tool argument string into a positive integer, or undefined if absent/invalid. */
 function parsePositiveInt(raw: string | undefined): number | undefined {
-  if (raw === undefined) return undefined;
+  if (raw === undefined || raw === "") return undefined;
   const parsed = Number.parseInt(raw, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
-function safeJson(raw: string): Record<string, string> {
+/** True for true/1/yes/on (case-insensitive). Handles boolean JSON coerced to string. */
+function parseTruthy(raw: string | undefined): boolean {
+  if (raw === undefined || raw === "") return false;
+  const v = raw.trim().toLowerCase();
+  return v === "true" || v === "1" || v === "yes" || v === "on";
+}
+
+/** True for false/0/no/off. */
+function parseFalsy(raw: string | undefined): boolean {
+  if (raw === undefined || raw === "") return false;
+  const v = raw.trim().toLowerCase();
+  return v === "false" || v === "0" || v === "no" || v === "off";
+}
+
+/** Coerce tool-call JSON args to string map (models often emit booleans/numbers). */
+export function coerceToolArguments(raw: string): Record<string, string> {
+  const typed = parseTypedToolArguments(raw);
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(typed)) {
+    if (value === null || value === undefined) {
+      out[key] = "";
+    } else if (typeof value === "string") {
+      out[key] = value;
+    } else if (typeof value === "number" || typeof value === "boolean") {
+      out[key] = String(value);
+    } else {
+      out[key] = JSON.stringify(value);
+    }
+  }
+  return out;
+}
+
+/** Keep typed JSON values for MCP tools that expect numbers/booleans/objects. */
+export function parseTypedToolArguments(raw: string): Record<string, unknown> {
   try {
-    return JSON.parse(raw) as Record<string, string>;
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return parsed as Record<string, unknown>;
   } catch {
     return {};
   }
+}
+
+function safeJson(raw: string): Record<string, string> {
+  return coerceToolArguments(raw);
 }

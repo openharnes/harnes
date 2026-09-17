@@ -1,0 +1,11 @@
+{
+  "list_dir_cwd": [{ "name": "list_dir", "arguments": {} }],
+  "read_file_index": [{ "name": "read_file", "arguments": { "path": "index.html" } }],
+  "glob_ts": [{ "name": "glob", "arguments": { "pattern": "src/**/*.ts" } }],
+  "grep_pattern": [{ "name": "grep", "arguments": { "pattern": "AGENT_TOOLS" } }],
+  "edit_not_write": [{ "name": "edit_file", "arguments": { "path": "package.json" } }],
+  "git_status_prefer": [{ "name": "git_status", "arguments": {} }],
+  "run_tests_prefer": [{ "name": "run_tests", "arguments": {} }],
+  "abstain_hello": [],
+  "no_stall_spin_up": [{ "name": "list_dir", "arguments": {} }]
+}

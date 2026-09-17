@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { runAgentLoop, shouldAutoContinue, type CompletionClient } from "./loop.ts";
+import { coerceToolArguments, runAgentLoop, shouldAutoContinue, type CompletionClient } from "./loop.ts";
 import type { McpToolProvider } from "./mcp/manager.ts";
 import type { ExecutionBackend } from "./exec/types.ts";
 import { LocalBackend } from "./exec/local.ts";
@@ -13,6 +13,65 @@ import { DEFAULT_CONFIG } from "./config.ts";
 import { isToolAllowed, needsApproval } from "./exec/types.ts";
 
 const model = getModel("qwen3-coder-30b");
+
+describe("coerceToolArguments", () => {
+  it("coerces boolean and number JSON values to strings", () => {
+    const args = coerceToolArguments('{"replace_all":true,"offset":12,"path":"a.txt"}');
+    assert.equal(args.replace_all, "true");
+    assert.equal(args.offset, "12");
+    assert.equal(args.path, "a.txt");
+  });
+
+  it("returns empty object on invalid JSON", () => {
+    assert.deepEqual(coerceToolArguments("{"), {});
+  });
+});
+
+describe("agent loop abort + empty tool args", () => {
+  it("stops with stoppedReason=aborted when signal fires between steps", async () => {
+    const backend = memoryBackend();
+    const ac = new AbortController();
+    let calls = 0;
+    const result = await runAgentLoop({
+      prompt: "do stuff",
+      model,
+      backend,
+      permissionMode: "build",
+      signal: ac.signal,
+      complete: async () => {
+        calls += 1;
+        if (calls === 1) {
+          ac.abort();
+          return {
+            content: "",
+            toolCalls: [{ id: "1", name: "list_dir", arguments: { path: "." } }],
+          };
+        }
+        return { content: "should not reach", toolCalls: [] };
+      },
+    });
+    assert.equal(result.stoppedReason, "aborted");
+    assert.ok(calls >= 1);
+  });
+
+  it("returns a clear tool error for empty read_file path", async () => {
+    const backend = memoryBackend();
+    const result = await runAgentLoop({
+      prompt: "read",
+      model,
+      backend,
+      permissionMode: "build",
+      complete: async () => ({
+        content: "",
+        toolCalls: [{ id: "1", name: "read_file", arguments: { path: "" } }],
+      }),
+      maxSteps: 2,
+    });
+    // First step returns tool error then model may finish — check tool message
+    const toolMsg = result.messages.find((m) => m.role === "tool");
+    assert.ok(toolMsg?.content.includes("non-empty path"));
+  });
+});
 
 describe("shouldAutoContinue", () => {
   it("nudges when the model only announces the next action", () => {
@@ -30,6 +89,11 @@ describe("shouldAutoContinue", () => {
     assert.equal(shouldAutoContinue("Server is running at http://127.0.0.1:8000 — let me know if you need anything else."), false);
     assert.equal(shouldAutoContinue("Here's what I found in the folder."), false);
     assert.equal(shouldAutoContinue(""), false);
+  });
+
+  it("does not nudge explanatory prose as if it were a tool stall", () => {
+    assert.equal(shouldAutoContinue("First, let me explain how the router picks a model."), false);
+    assert.equal(shouldAutoContinue("I'll clarify the difference between ask and plan mode."), false);
   });
 });
 
@@ -199,18 +263,23 @@ describe("agent loop", () => {
     assert.equal(result.stoppedReason, "complete");
   });
 
-  it("denies bash in plan mode", async () => {
+  it("denies bash in plan mode but continues the turn", async () => {
+    let calls = 0;
     const result = await runAgentLoop({
       prompt: "rm -rf",
       model,
       backend: memoryBackend(),
       permissionMode: "plan",
-      complete: async () => ({
-        content: "",
-        toolCalls: [{ id: "1", name: "bash", arguments: { command: "rm -rf /" } }],
-      }),
+      complete: async () => {
+        calls += 1;
+        if (calls === 1) {
+          return { content: "", toolCalls: [{ id: "1", name: "bash", arguments: { command: "rm -rf /" } }] };
+        }
+        return { content: "I cannot run bash in plan mode.", toolCalls: [] };
+      },
     });
-    assert.equal(result.stoppedReason, "denied-tool");
+    assert.equal(result.stoppedReason, "complete");
+    assert.ok(result.messages.some((m) => m.role === "tool" && m.content.includes("not available in plan mode")));
   });
 
   it("edits a file via edit_file (exact replace)", async () => {
@@ -317,18 +386,26 @@ describe("agent loop", () => {
     assert.equal(backend.files.get("b.txt"), "new file");
   });
 
-  it("denies edit_file in plan mode", async () => {
+  it("denies edit_file in plan mode but continues the turn", async () => {
+    let calls = 0;
     const result = await runAgentLoop({
       prompt: "edit a.txt",
       model,
       backend: memoryBackend(),
       permissionMode: "plan",
-      complete: async () => ({
-        content: "",
-        toolCalls: [{ id: "1", name: "edit_file", arguments: { path: "a.txt", old_string: "x", new_string: "y" } }],
-      }),
+      complete: async () => {
+        calls += 1;
+        if (calls === 1) {
+          return {
+            content: "",
+            toolCalls: [{ id: "1", name: "edit_file", arguments: { path: "a.txt", old_string: "x", new_string: "y" } }],
+          };
+        }
+        return { content: "Cannot edit in plan mode.", toolCalls: [] };
+      },
     });
-    assert.equal(result.stoppedReason, "denied-tool");
+    assert.equal(result.stoppedReason, "complete");
+    assert.ok(result.messages.some((m) => m.role === "tool" && /not available in plan mode/.test(m.content)));
   });
 
   it("carries conversation history into the next turn", async () => {
@@ -476,7 +553,7 @@ describe("parallel tool execution", () => {
         return { content: "done", toolCalls: [] };
       },
     });
-    assert.equal(result.stoppedReason, "denied-tool");
+    assert.equal(result.stoppedReason, "complete");
     // The sibling write_file call still ran even though bash was denied.
     assert.equal(backend.files.get("a.txt"), "hi");
     const toolMessages = result.messages.filter((message) => message.role === "tool");
@@ -583,18 +660,23 @@ describe("git tools wiring in the loop", () => {
     assert.ok(result.messages.some((m) => m.content === "log capped at 5"));
   });
 
-  it("denies git_commit in plan mode", async () => {
+  it("denies git_commit in plan mode but continues the turn", async () => {
+    let calls = 0;
     const result = await runAgentLoop({
       prompt: "commit",
       model,
       backend: memoryBackend(),
       permissionMode: "plan",
-      complete: async () => ({
-        content: "",
-        toolCalls: [{ id: "1", name: "git_commit", arguments: { message: "wip" } }],
-      }),
+      complete: async () => {
+        calls += 1;
+        if (calls === 1) {
+          return { content: "", toolCalls: [{ id: "1", name: "git_commit", arguments: { message: "wip" } }] };
+        }
+        return { content: "Cannot commit in plan mode.", toolCalls: [] };
+      },
     });
-    assert.equal(result.stoppedReason, "denied-tool");
+    assert.equal(result.stoppedReason, "complete");
+    assert.ok(result.messages.some((m) => m.role === "tool" && /not available in plan mode/.test(m.content)));
   });
 
   it("commits with an explicit message in build mode", async () => {
@@ -728,18 +810,23 @@ describe("run_tests tool wiring in the loop", () => {
     assert.ok(result.messages.some((m) => m.content.includes("FAILED: npm run lint (exit 1)")));
   });
 
-  it("denies run_tests in plan mode", async () => {
+  it("denies run_tests in plan mode but continues the turn", async () => {
+    let calls = 0;
     const result = await runAgentLoop({
       prompt: "run tests",
       model,
       backend: memoryBackend(),
       permissionMode: "plan",
-      complete: async () => ({
-        content: "",
-        toolCalls: [{ id: "1", name: "run_tests", arguments: {} }],
-      }),
+      complete: async () => {
+        calls += 1;
+        if (calls === 1) {
+          return { content: "", toolCalls: [{ id: "1", name: "run_tests", arguments: {} }] };
+        }
+        return { content: "Cannot run tests in plan mode.", toolCalls: [] };
+      },
     });
-    assert.equal(result.stoppedReason, "denied-tool");
+    assert.equal(result.stoppedReason, "complete");
+    assert.ok(result.messages.some((m) => m.role === "tool" && /not available in plan mode/.test(m.content)));
   });
 
   it("surfaces a clear tool error when no test script and no command are available", async () => {
@@ -965,20 +1052,28 @@ describe("local backend explore tools", () => {
     }
   });
 
-  it("denies glob/grep/list_dir calls in plan mode when routed through the loop", async () => {
+  it("denies write_file in plan mode but continues the turn", async () => {
     const { backend, cleanup } = await makeWorkspace();
     try {
+      let calls = 0;
       const result = await runAgentLoop({
         prompt: "explore",
         model,
         backend,
         permissionMode: "plan",
-        complete: async () => ({
-          content: "",
-          toolCalls: [{ id: "1", name: "write_file", arguments: { path: "x.txt", contents: "no" } }],
-        }),
+        complete: async () => {
+          calls += 1;
+          if (calls === 1) {
+            return {
+              content: "",
+              toolCalls: [{ id: "1", name: "write_file", arguments: { path: "x.txt", contents: "no" } }],
+            };
+          }
+          return { content: "staying read-only", toolCalls: [] };
+        },
       });
-      assert.equal(result.stoppedReason, "denied-tool");
+      assert.equal(result.stoppedReason, "complete");
+      assert.ok(result.messages.some((m) => m.role === "tool" && /not available in plan mode/.test(m.content)));
     } finally {
       await cleanup();
     }
@@ -1219,9 +1314,10 @@ describe("delegate subagent tool", () => {
     });
 
     assert.equal(result.stoppedReason, "complete");
-    assert.equal(callCount, 3);
+    // Parent step1 + child step1 (denied write) + child step2 (text) + parent step2
+    assert.equal(callCount, 4);
     assert.equal(backend.files.has("x.txt"), false);
-    assert.ok(result.messages.some((m) => m.content.includes("plan mode") && m.content.includes("denied-tool")));
+    assert.ok(result.messages.some((m) => /not available in plan mode|Subagent done/.test(m.content)));
     assert.ok(result.messages.some((m) => m.content.includes("no files touched")));
   });
 
@@ -1399,32 +1495,42 @@ describe("MCP tools in the agent loop", () => {
     });
     assert.equal(readAllowed.stoppedReason, "complete");
 
+    let writeStep = 0;
     const writeDenied = await runAgentLoop({
       prompt: "write a note",
       model,
       backend: memoryBackend(),
       permissionMode: "plan",
       mcp: fakeMcp(),
-      complete: async () => ({
-        content: "",
-        toolCalls: [{ id: "1", name: "mcp__notes__write_note", arguments: {} }],
-      }),
+      complete: async () => {
+        writeStep += 1;
+        if (writeStep === 1) {
+          return { content: "", toolCalls: [{ id: "1", name: "mcp__notes__write_note", arguments: {} }] };
+        }
+        return { content: "cannot write in plan", toolCalls: [] };
+      },
     });
-    assert.equal(writeDenied.stoppedReason, "denied-tool");
+    assert.equal(writeDenied.stoppedReason, "complete");
+    assert.ok(writeDenied.messages.some((m) => m.role === "tool" && /not available in plan mode/.test(m.content)));
   });
 
   it("denies an MCP tool call when no mcp provider is configured on the loop", async () => {
+    let calls = 0;
     const result = await runAgentLoop({
       prompt: "call an mcp tool with no provider wired up",
       model,
       backend: memoryBackend(),
       permissionMode: "build",
-      complete: async () => ({
-        content: "",
-        toolCalls: [{ id: "1", name: "mcp__ghost__whatever", arguments: {} }],
-      }),
+      complete: async () => {
+        calls += 1;
+        if (calls === 1) {
+          return { content: "", toolCalls: [{ id: "1", name: "mcp__ghost__whatever", arguments: {} }] };
+        }
+        return { content: "no mcp", toolCalls: [] };
+      },
     });
-    assert.equal(result.stoppedReason, "denied-tool");
+    assert.equal(result.stoppedReason, "complete");
+    assert.ok(result.messages.some((m) => m.role === "tool" && /not available in build mode|no MCP/.test(m.content)));
   });
 
   it("adds no tools and adds no overhead when mcp is omitted (disabled by default)", async () => {

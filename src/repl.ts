@@ -16,6 +16,7 @@ import {
   SESSION_MODES,
 } from "./exec/types.ts";
 import {
+  CONTINUE_NUDGE,
   openaiCompatibleComplete,
   runAgentLoop,
   shouldAutoContinue,
@@ -46,6 +47,7 @@ import {
   type SessionUsage,
 } from "./session.ts";
 import { applyUpdate, checkForUpdate, NPM_PACKAGE } from "./update.ts";
+import { HARNES_VERSION } from "./version.ts";
 
 export type { SessionUsage };
 
@@ -88,26 +90,24 @@ function startStatusLine(initial = "Running"): { update: (text: string) => void;
   };
 }
 
-const VERSION = "0.3.2";
+const VERSION = HARNES_VERSION;
 const FOOTER_ROWS = 3; // full-width rule + status + bottom bar
 
 const SLASH_COMMANDS: Array<{ cmd: string; help: string }> = [
-  { cmd: "/help", help: "show commands" },
+  { cmd: "/help", help: "show commands (/h)" },
   { cmd: "/setup", help: "configure OpenRouter or Ollama" },
   { cmd: "/status", help: "model, mode, context, cwd" },
   { cmd: "/todos", help: "show the current task list" },
   { cmd: "/mcp", help: "list configured MCP servers/tools/status" },
   { cmd: "/skills", help: "list available skill files" },
-  { cmd: "/model", help: "show / pin active model" },
-  { cmd: "/model auto", help: "route per prompt" },
+  { cmd: "/model", help: "show / pin active model (/model auto to un-pin)" },
   { cmd: "/models", help: "list catalog" },
-  { cmd: "/mode", help: "auto | manual | ask | plan  (⌃T / ⇧Tab)" },
+  { cmd: "/mode", help: "auto | manual | ask | plan  (labels: automatic / ask on edit)  ⌃T / ⇧Tab" },
   { cmd: "/usage", help: "session + OpenRouter spend" },
   { cmd: "/cost", help: "alias for /usage" },
-  { cmd: "/update", help: "check / install latest from npm" },
-  { cmd: "/update auto on", help: "opt-in: auto-install on startup" },
+  { cmd: "/update", help: "check / install latest from npm (/update auto on|off)" },
   { cmd: "/clear", help: "reset conversation memory" },
-  { cmd: "/exit", help: "quit" },
+  { cmd: "/exit", help: "quit (aliases: /quit, /q)" },
 ];
 
 const ansi = {
@@ -175,13 +175,23 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
   let config = initialConfig;
   const cwd = process.cwd();
   const backend = new LocalBackend(cwd);
-  const mcp = new McpManager(config.mcpServers ?? {});
+  let mcp = new McpManager(config.mcpServers ?? {});
   const history: ChatMessage[] = [];
   const todos: TodoItem[] = [];
   const usage: SessionUsage = emptySessionUsage();
   let lastDone = "";
   let turnBusy = false;
+  let slashBusy = false;
   let painting = false;
+  let turnAbort: AbortController | undefined;
+
+  const replaceMcp = async (nextConfig: HarnesConfig) => {
+    const prev = JSON.stringify(config.mcpServers ?? {});
+    const next = JSON.stringify(nextConfig.mcpServers ?? {});
+    if (prev === next) return;
+    await mcp.close();
+    mcp = new McpManager(nextConfig.mcpServers ?? {});
+  };
 
   if (!process.stdin.isTTY) {
     console.error("Persistent session needs a TTY. Use `harnes run \"...\"` for one-shot.");
@@ -235,7 +245,7 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
     const branch = gitBranch(cwd);
     const chips = [
       chip("◆"),
-      chip("explorer"),
+      chip(session.modeLabel),
       chip(shortCwd(cwd)),
       ...(branch ? [chip(branch)] : []),
     ].join(" ");
@@ -247,13 +257,21 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
 
   /** Keep the status strip under the input while typing (readline otherwise wipes it). */
   const paintFooterUnderInput = () => {
-    if (turnBusy || painting) return;
+    if (turnBusy || painting || slashBusy) return;
     painting = true;
     try {
       const plainPrompt = " › ";
-      const cursor = rl.cursor ?? (rl.line ?? "").length;
-      const col = plainPrompt.length + 1 + cursor;
-      output.write(`\n\x1b[0J${footerBlock()}\x1b[${FOOTER_ROWS}A\x1b[${col}G`);
+      const line = rl.line ?? "";
+      const width = Math.max(20, process.stdout.columns || 80);
+      const inputRows = Math.max(1, Math.ceil((plainPrompt.length + Math.max(line.length, 1)) / width));
+      const cursor = rl.cursor ?? line.length;
+      const absCol = plainPrompt.length + cursor;
+      const rowInInput = Math.floor(absCol / width);
+      const col = (absCol % width) + 1;
+      // Clear below prompt, paint footer, then move cursor back onto the input row.
+      output.write(`\n\x1b[0J${footerBlock()}`);
+      const up = FOOTER_ROWS + (inputRows - 1 - rowInInput);
+      output.write(`\x1b[${up}A\x1b[${col}G`);
     } finally {
       painting = false;
     }
@@ -275,6 +293,7 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
   };
 
   const cycleModeFromKey = async () => {
+    if (turnBusy) return;
     const nextMode = cycleSessionMode(normalizeSessionMode(config.sessionMode));
     config = {
       ...config,
@@ -311,6 +330,17 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
   };
 
   rl.on("SIGINT", () => {
+    if (slashBusy) {
+      clearBelowInput();
+      output.write(`${paint(ansi.muted, "(finish /setup or press Enter — Ctrl+C ignored during slash wizards)")}\n`);
+      return;
+    }
+    if (turnBusy && turnAbort && !turnAbort.signal.aborted) {
+      turnAbort.abort();
+      clearBelowInput();
+      output.write(`${paint(ansi.muted, "(interrupted — stopping this turn…)")}\n`);
+      return;
+    }
     clearBelowInput();
     output.write(`${paint(ansi.muted, "(interrupted — /clear to reset, /exit to quit)")}\n`);
     showIdle();
@@ -333,30 +363,39 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
     }
 
     if (text.startsWith("/")) {
-      const done = await handleSlash(text, {
-        getConfig: () => config,
-        setConfig: async (next) => {
-          config = next;
-          await saveConfig(config);
-        },
-        history,
-        todos,
-        usage,
-        cwd,
-        rl,
-        mcp,
-      });
-      if (done === "exit") break;
+      slashBusy = true;
+      try {
+        const done = await handleSlash(text, {
+          getConfig: () => config,
+          setConfig: async (next) => {
+            await replaceMcp(next);
+            config = next;
+            await saveConfig(config);
+          },
+          history,
+          todos,
+          usage,
+          cwd,
+          rl,
+          getMcp: () => mcp,
+        });
+        if (done === "exit") break;
+      } finally {
+        slashBusy = false;
+      }
       showIdle();
       continue;
     }
 
     try {
       turnBusy = true;
-      lastDone = await runTurn(text, config, backend, mcp, history, todos, usage, rl, cwd);
+      turnAbort = new AbortController();
+      lastDone = await runTurn(text, config, backend, mcp, history, todos, usage, rl, cwd, turnAbort.signal);
     } catch (error) {
       console.error(error instanceof Error ? error.message : error);
       lastDone = "error";
+    } finally {
+      turnAbort = undefined;
     }
     showIdle();
   }
@@ -367,8 +406,25 @@ export async function startRepl(initialConfig: HarnesConfig): Promise<void> {
 /** Only complete slash commands; never dump the full menu on bare Tab / reverse-Tab. */
 function slashCompleter(line: string): [string[], string] {
   if (!line.startsWith("/")) return [[], line];
-  const hits = SLASH_COMMANDS.map((c) => c.cmd).filter((c) => c.startsWith(line));
-  return [hits, line];
+  // Complete the first token only (e.g. "/mo" → "/mode", "/model")
+  const space = line.indexOf(" ");
+  if (space !== -1) {
+    const cmd = line.slice(0, space);
+    const rest = line.slice(space + 1);
+    if (cmd === "/mode" || cmd === "/model") {
+      const modeHits = ["auto", "manual", "ask", "plan"].filter((m) => m.startsWith(rest));
+      if (cmd === "/mode" && modeHits.length) return [modeHits.map((m) => `${cmd} ${m}`), line];
+      if (cmd === "/model") {
+        const modelHits = ["auto", ...MODEL_CATALOG.map((m) => m.id)].filter((m) => m.startsWith(rest));
+        if (modelHits.length) return [modelHits.map((m) => `${cmd} ${m}`), line];
+      }
+    }
+    return [[], line];
+  }
+  const hits = SLASH_COMMANDS.map((c) => c.cmd).filter((c) => c.startsWith(line) && !c.includes(" ", 1));
+  // Prefer unique base commands over "/model auto" style duplicates when completing "/m"
+  const bases = [...new Set(hits.map((h) => h.split(" ")[0]))];
+  return [bases.length ? bases : hits, line];
 }
 
 function printWelcomeBox(
@@ -405,10 +461,10 @@ function printWelcomeBox(
     paint(ansi.cmd, "/model") + paint(ansi.muted, " pin Qwen / Claude / GPT"),
     paint(ansi.cmd, "/mode") + paint(ansi.muted, "  ⌃T / ⇧Tab cycle modes"),
     "",
-    paint(ansi.accentBright, "Recent activity"),
+    paint(ansi.accentBright, "This session"),
     history.length === 0
-      ? paint(ansi.muted, "No recent activity")
-      : paint(ansi.muted, `${history.filter((m) => m.role === "user").length} turns in this session`),
+      ? paint(ansi.muted, "Fresh start — type a task")
+      : paint(ansi.muted, `${history.filter((m) => m.role === "user").length} user turns so far`),
   ];
 
   const rows = Math.max(left.length, right.length);
@@ -453,8 +509,12 @@ function printWelcome(cwd: string): void {
   console.log("");
 }
 
-async function runSetup(config: HarnesConfig, opts: { nested: boolean }): Promise<HarnesConfig> {
-  const rl = readline.createInterface({ input, output, terminal: true });
+async function runSetup(
+  config: HarnesConfig,
+  opts: { nested: boolean; rl?: readline.Interface }
+): Promise<HarnesConfig> {
+  const ownsRl = !opts.rl;
+  const rl = opts.rl ?? readline.createInterface({ input, output, terminal: true });
   if (!opts.nested) printWelcome(process.cwd());
   console.log("How should Harnes talk to models?");
   console.log("  1) OpenRouter  (cloud, recommended — one key, many models)");
@@ -502,7 +562,7 @@ async function runSetup(config: HarnesConfig, opts: { nested: boolean }): Promis
     permissionMode: permissionForSessionMode(sessionMode),
   };
 
-  rl.close();
+  if (ownsRl) rl.close();
   await saveConfig(next);
   console.log("");
   return next;
@@ -552,7 +612,7 @@ async function handleSlash(
     usage: SessionUsage;
     cwd: string;
     rl: readline.Interface;
-    mcp: McpManager;
+    getMcp: () => McpManager;
   }
 ): Promise<"ok" | "exit"> {
   const [cmd, ...rest] = text.slice(1).split(/\s+/);
@@ -581,7 +641,7 @@ async function handleSlash(
       }
       return "ok";
     case "mcp":
-      await printMcpStatus(ctx.mcp);
+      await printMcpStatus(ctx.getMcp());
       return "ok";
     case "skills": {
       const skills = await listSkills(ctx.cwd);
@@ -617,6 +677,9 @@ async function handleSlash(
         console.log("Usage: /mode auto|manual|ask|plan   (or ⌃T / ⇧Tab)");
         return "ok";
       }
+      if (arg.toLowerCase() === "build") {
+        console.log(paint(ansi.muted, 'Note: legacy alias "build" maps to mode auto (permission=build tools).'));
+      }
       const sessionMode = normalizeSessionMode(arg);
       await ctx.setConfig({
         ...ctx.getConfig(),
@@ -628,15 +691,51 @@ async function handleSlash(
       return "ok";
     }
     case "setup": {
-      const next = await runSetup(ctx.getConfig(), { nested: true });
+      const next = await runSetup(ctx.getConfig(), { nested: true, rl: ctx.rl });
       await ctx.setConfig(next);
       printWelcomeBox(next, ctx.cwd, ctx.history, { firstRun: false });
       return "ok";
     }
-    default:
-      console.log(`Unknown command /${cmd}. Try /help.`);
+    default: {
+      const suggestion = suggestSlashCommand(cmd);
+      console.log(
+        suggestion
+          ? `Unknown command /${cmd}. Did you mean /${suggestion}? Try /help.`
+          : `Unknown command /${cmd}. Try /help.`
+      );
       return "ok";
+    }
   }
+}
+
+function suggestSlashCommand(raw: string): string | undefined {
+  const names = ["help", "setup", "status", "todos", "mcp", "skills", "model", "models", "mode", "usage", "cost", "update", "clear", "exit", "quit", "q", "h"];
+  const needle = raw.toLowerCase();
+  let best: string | undefined;
+  let bestDist = 3;
+  for (const name of names) {
+    const d = editDistance(needle, name);
+    if (d < bestDist) {
+      bestDist = d;
+      best = name;
+    }
+  }
+  return best;
+}
+
+function editDistance(a: string, b: string): number {
+  const rows = a.length + 1;
+  const cols = b.length + 1;
+  const dp: number[][] = Array.from({ length: rows }, () => Array(cols).fill(0));
+  for (let i = 0; i < rows; i += 1) dp[i][0] = i;
+  for (let j = 0; j < cols; j += 1) dp[0][j] = j;
+  for (let i = 1; i < rows; i += 1) {
+    for (let j = 1; j < cols; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+    }
+  }
+  return dp[a.length][b.length];
 }
 
 async function handleUpdateCommand(
@@ -758,7 +857,7 @@ async function setModel(
       }
     }
     const model = getModel(normalizeModelId(arg));
-    const pinId = model.openrouterModel ?? model.id;
+    const pinId = endpoint.provider === "openrouter" ? (model.openrouterModel ?? model.id) : model.id;
     await ctx.setConfig({ ...ctx.getConfig(), pinnedModelId: pinId });
     console.log(`Pinned ${model.name} (${pinId}) · ctx ${model.minContext.toLocaleString()}`);
   } catch (error) {
@@ -774,11 +873,27 @@ function summarizeTool(call: ToolCall): string {
   }
   if (call.name === "read_file") return `read_file ${call.arguments.path ?? ""}`;
   if (call.name === "edit_file") return `edit_file ${call.arguments.path ?? ""}`;
+  if (call.name === "list_dir") return `list_dir ${call.arguments.path || "."}`;
+  if (call.name === "glob") return `glob ${call.arguments.pattern ?? "**"}`;
+  if (call.name === "grep") {
+    const pat = call.arguments.pattern ?? "";
+    const scope = call.arguments.path || call.arguments.glob || "";
+    return `grep ${pat.length > 40 ? `${pat.slice(0, 37)}…` : pat}${scope ? ` in ${scope}` : ""}`;
+  }
+  if (call.name === "run_tests") {
+    if (call.arguments.command) return `run_tests cmd=${call.arguments.command.slice(0, 50)}`;
+    if (call.arguments.script) return `run_tests script=${call.arguments.script}`;
+    return "run_tests";
+  }
+  if (call.name === "skill") return call.arguments.name ? `skill ${call.arguments.name}` : "skill (list)";
   if (call.name === "todo_write") return "todo_write (update task list)";
   if (call.name === "git_status") return "git_status";
   if (call.name === "git_diff") return `git_diff ${call.arguments.path ?? ""}`.trim();
   if (call.name === "git_log") return "git_log";
-  if (call.name === "git_commit") return `git_commit ${JSON.stringify(call.arguments.message ?? "").slice(0, 60)}`;
+  if (call.name === "git_commit") {
+    const stage = call.arguments.stage_all === "false" || call.arguments.stage_all === "0" ? "staged-only" : "stage-all";
+    return `git_commit (${stage}) ${JSON.stringify(call.arguments.message ?? "").slice(0, 60)}`;
+  }
   if (call.name === "delegate") {
     const mode = call.arguments.mode === "build" ? "build" : "plan";
     const task = call.arguments.task ?? "";
@@ -797,7 +912,8 @@ async function runTurn(
   todos: TodoItem[],
   usage: SessionUsage,
   rl: readline.Interface,
-  cwd: string
+  cwd: string,
+  signal?: AbortSignal
 ): Promise<string> {
   if (!hasUsableApiKey(config) && config.provider !== "ollama") {
     console.log("No API key configured. Run /setup first.");
@@ -821,6 +937,7 @@ async function runTurn(
       mcp: mcp.enabled ? mcp : undefined,
       cwd,
       hooks: config.hooks,
+      signal,
       complete: (input) => openaiCompatibleComplete(endpoint.baseUrl, endpoint.apiKey, input),
       onProgress: (event: LoopProgress) => {
         if (event.type === "thinking") status.update(`Thinking · step ${event.step}`);
@@ -828,17 +945,28 @@ async function runTurn(
         else status.update(`${event.name} · step ${event.step}`);
       },
       onApprove: async (call) => {
+        if (signal?.aborted) return false;
         const mcpClass = call.name.startsWith(MCP_TOOL_PREFIX) ? mcp.classify(call.name) : undefined;
-        if (!needsApproval(mode, call.name, mcpClass)) return true;
+        if (!needsApproval(mode, call.name, mcpClass, call.arguments)) return true;
         status.stop();
-        const answer = (await rl.question(paint(ansi.warm, `Allow ${summarizeTool(call)}? [y/N] `)))
+        const answer = (await rl.question(paint(ansi.warm, `Allow ${summarizeTool(call)}? [Y/n] `)))
           .trim()
           .toLowerCase();
-        const ok = answer === "y" || answer === "yes";
+        if (signal?.aborted) return false;
+        const ok = answer === "" || answer === "y" || answer === "yes";
         status = startStatusLine(ok ? call.name : "Running");
         return ok;
       },
     });
+
+    const elapsedSec = ((Date.now() - started) / 1000).toFixed(1);
+    const turnCost = result.usage.costUsd ?? 0;
+
+    if (result.stoppedReason === "aborted") {
+      status.stop(`✗ Interrupted · ${elapsedSec}s · ${result.steps} step${result.steps === 1 ? "" : "s"}`);
+      // Do not commit a partial/invalid transcript into session history.
+      return `✗ ${elapsedSec}s interrupted`;
+    }
 
     usage.turns += 1;
     usage.agentSteps += result.steps;
@@ -848,15 +976,22 @@ async function runTurn(
     usage.costUsd += result.usage.costUsd ?? 0;
 
     history.length = 0;
-    history.push(...result.messages.filter((message) => message.role !== "system"));
+    history.push(...compactHistoryMessages(result.messages));
 
-    const elapsedSec = ((Date.now() - started) / 1000).toFixed(1);
-    const turnCost = result.usage.costUsd ?? 0;
     const costPart =
       endpoint.provider === "openrouter" || turnCost > 0
         ? ` · ${formatUsd(turnCost)} this turn · ${formatUsd(usage.costUsd)} session`
         : "";
-    const summary = `✓ Done · ${elapsedSec}s · ${result.steps} step${result.steps === 1 ? "" : "s"} · ${result.stoppedReason}${costPart}`;
+
+    const summaryGlyph =
+      result.stoppedReason === "complete" ? "✓" : result.stoppedReason === "max-steps" ? "…" : "!";
+    const summaryLabel =
+      result.stoppedReason === "complete"
+        ? "Done"
+        : result.stoppedReason === "max-steps"
+          ? "Hit step limit"
+          : result.stoppedReason;
+    const summary = `${summaryGlyph} ${summaryLabel} · ${elapsedSec}s · ${result.steps} step${result.steps === 1 ? "" : "s"} · ${result.stoppedReason}${costPart}`;
     status.stop(summary);
 
     const assistants = result.messages.filter((message) => message.role === "assistant" && message.content.trim());
@@ -930,10 +1065,11 @@ function printFullStatus(
   console.log(`model      ${session.model.name} (${session.wireId}) [${session.routing}]`);
   console.log(`mode       ${session.modeLabel} (${session.mode}) · tools ${session.permissionMode}`);
   console.log(`autoUpdate ${config.autoUpdate ? "on" : "off"}`);
-  console.log(`context    ${formatTokenBar(session.tokensUsed, session.contextWindow)}`);
+  console.log(`context    ~${formatTokenBar(session.tokensUsed, session.contextWindow)} (estimate)`);
   console.log(`cwd        ${shortCwd(cwd)}`);
   console.log(`history    ${history.length} messages`);
   console.log(`usage      turns=${usage.turns} tools=${usage.toolCalls} spend=${formatUsd(usage.costUsd)}`);
+  console.log(`mcp        ${(config.mcpServers && Object.keys(config.mcpServers).length > 0) ? `${Object.keys(config.mcpServers).length} server(s)` : "off"}`);
   if (todos.length > 0) {
     const done = todos.filter((item) => item.status === "completed").length;
     console.log(`todos      ${done}/${todos.length} done · /todos for details`);
@@ -946,4 +1082,24 @@ function maskKey(key: string | undefined): string {
   if (key === "ollama") return "ollama";
   if (key.length < 12) return "***";
   return `${key.slice(0, 6)}…${key.slice(-4)}`;
+}
+
+/** Cap tool-result blobs kept in session history so context doesn't explode. */
+const HISTORY_TOOL_RESULT_CAP = 4_000;
+
+function compactHistoryMessages(messages: ChatMessage[]): ChatMessage[] {
+  return messages
+    .filter(
+      (message) =>
+        message.role !== "system" &&
+        !(message.role === "user" && message.content === CONTINUE_NUDGE)
+    )
+    .map((message) => {
+      if (message.role !== "tool" || message.content.length <= HISTORY_TOOL_RESULT_CAP) return message;
+      const omitted = message.content.length - HISTORY_TOOL_RESULT_CAP;
+      return {
+        ...message,
+        content: `${message.content.slice(0, HISTORY_TOOL_RESULT_CAP)}\n... truncated ${omitted} characters from history ...`,
+      };
+    });
 }

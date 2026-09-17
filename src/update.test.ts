@@ -10,6 +10,8 @@ describe("update", () => {
     assert.ok(compareSemver("0.2.0", "0.1.9") > 0);
     assert.ok(compareSemver("0.1.9", "0.2.0") < 0);
     assert.equal(compareSemver("0.2.0", "0.2.0"), 0);
+    assert.ok(compareSemver("1.0.0", "1.0.0-rc.1") > 0);
+    assert.ok(compareSemver("1.0.0-rc.1", "1.0.0") < 0);
   });
 
   it("detects an available update from the registry payload", async () => {

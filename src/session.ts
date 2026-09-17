@@ -115,7 +115,7 @@ export interface FooterChrome {
   separator: string;
   /** Mode / hints on the left, model + cost on the right. */
   status: string;
-  /** Logo + explorer + path + branch chips. */
+  /** Logo + mode + path + branch chips. */
   bar: string;
 }
 
@@ -194,8 +194,8 @@ export function formatFooterChrome(opts: {
   const right = rightParts.join(" · ");
 
   const path = shortPath(cwd);
-  // Chip-style bottom strip: logo · explorer · path · branch (Copilot / Cursor vibe)
-  const chips = [`◆ Harnes`, `explorer`, path, branch || undefined].filter(Boolean) as string[];
+  // Chip-style bottom strip: logo · mode · path · branch
+  const chips = [`◆ Harnes`, session.modeLabel, path, branch || undefined].filter(Boolean) as string[];
   const barLeft = chips.join("   ");
   const barRight = session.routing === "pinned" ? "pinned" : "/mode";
 

@@ -9,9 +9,9 @@
  *    (or `"*"` / omitted `match` for every tool) and run with the event
  *    payload as JSON on stdin.
  *
- * Hooks are best-effort and observational for this MVP: a failing or slow
- * hook is logged and never blocks, delays past its timeout, or fails the
- * tool call it wraps.
+ * Hooks are best-effort for this MVP: a failing hook is logged and never fails
+ * the tool call it wraps. Config shell hooks are awaited up to a short timeout
+ * (then SIGKILL) so they can add latency — keep them fast.
  */
 import { spawn } from "node:child_process";
 
@@ -106,34 +106,46 @@ function runShellHook(command: string, payload: HookPayload): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, { shell: true, stdio: ["pipe", "pipe", "pipe"] });
     let settled = false;
-    const timer = setTimeout(() => {
+    const finish = (fn: () => void) => {
       if (settled) return;
       settled = true;
-      child.kill();
-      reject(new Error(`timed out after ${HOOK_TIMEOUT_MS}ms`));
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      fn();
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
     }, HOOK_TIMEOUT_MS);
+    const killTimer = setTimeout(() => {
+      if (!settled) child.kill("SIGKILL");
+      finish(() => reject(new Error(`timed out after ${HOOK_TIMEOUT_MS}ms`)));
+    }, HOOK_TIMEOUT_MS + 2_000);
 
     let stderr = "";
     child.stderr?.on("data", (chunk: Buffer) => {
       stderr = (stderr + String(chunk)).slice(0, HOOK_STDERR_CAP);
     });
     child.on("error", (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      reject(error);
+      finish(() => reject(error));
     });
     child.on("close", (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (code !== 0) {
-        reject(new Error(`exit ${code}${stderr ? `: ${stderr}` : ""}`));
-        return;
-      }
-      resolve();
+      finish(() => {
+        if (code !== 0) {
+          reject(new Error(`exit ${code}${stderr ? `: ${stderr}` : ""}`));
+          return;
+        }
+        resolve();
+      });
     });
-    child.stdin?.write(JSON.stringify(payload));
-    child.stdin?.end();
+    const body =
+      payload.event === "postToolUse"
+        ? { ...payload, result: payload.result.slice(0, 8_000) }
+        : payload;
+    const ok = child.stdin?.write(JSON.stringify(body));
+    if (ok === false) {
+      child.stdin?.once("drain", () => child.stdin?.end());
+    } else {
+      child.stdin?.end();
+    }
   });
 }

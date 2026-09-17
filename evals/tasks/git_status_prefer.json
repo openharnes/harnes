@@ -1,0 +1,16 @@
+{
+  "id": "git_status_prefer",
+  "description": "Prefer git_status and report status after tools run",
+  "prompt": "Show me the current git status of this repo and summarize it briefly.",
+  "expect": [{ "name": "git_status" }],
+  "setup": {
+    "gitInit": true,
+    "files": {
+      "README.md": "hello\n"
+    }
+  },
+  "checks": [
+    { "type": "final_matches", "pattern": "clean|main|README|nothing to commit|working tree|up to date" }
+  ],
+  "tags": ["git", "outcome"]
+}

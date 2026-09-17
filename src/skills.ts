@@ -68,17 +68,14 @@ export async function loadSkill(name: string, cwd: string): Promise<string> {
   if (!safeName || safeName.includes("/") || safeName.includes("\\") || safeName.includes("..")) {
     throw new Error(`Invalid skill name "${name}".`);
   }
-  for (const dir of skillDirs(cwd)) {
-    const file = path.join(dir, `${safeName}.md`);
-    try {
-      const raw = await readFile(file, "utf8");
-      if (raw.length > SKILL_BODY_CAP) {
-        return `${raw.slice(0, SKILL_BODY_CAP)}\n... truncated ${raw.length - SKILL_BODY_CAP} characters ...`;
-      }
-      return raw;
-    } catch {
-      continue;
+  const listed = await listSkills(cwd);
+  const hit = listed.find((s) => s.name === safeName || s.name.toLowerCase() === safeName.toLowerCase());
+  if (hit) {
+    const raw = await readFile(hit.path, "utf8");
+    if (raw.length > SKILL_BODY_CAP) {
+      return `${raw.slice(0, SKILL_BODY_CAP)}\n... truncated ${raw.length - SKILL_BODY_CAP} characters ...`;
     }
+    return raw;
   }
   throw new Error(`Skill "${safeName}" not found in ${skillDirs(cwd).join(" or ")}.`);
 }

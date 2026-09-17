@@ -1,0 +1,15 @@
+{
+  "id": "glob_ts",
+  "description": "Find TypeScript files via glob and report them",
+  "prompt": "Find all TypeScript files under src using a glob, then list the matches.",
+  "expect": [{ "name": "glob" }],
+  "setup": {
+    "files": {
+      "src/a.ts": "export {};\n",
+      "src/b.ts": "export {};\n",
+      "readme.md": "docs\n"
+    }
+  },
+  "checks": [{ "type": "final_matches", "pattern": "a\\.ts" }],
+  "tags": ["explore", "outcome"]
+}

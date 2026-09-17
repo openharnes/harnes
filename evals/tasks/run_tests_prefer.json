@@ -1,0 +1,15 @@
+{
+  "id": "run_tests_prefer",
+  "description": "Prefer run_tests and report pass/fail after execution",
+  "prompt": "Run the project's test suite with run_tests and tell me whether it passed.",
+  "expect": [{ "name": "run_tests" }],
+  "setup": {
+    "files": {
+      "package.json": "{\n  \"name\": \"demo\",\n  \"scripts\": {\n    \"test\": \"node -e \\\"process.exit(0)\\\"\"\n  }\n}\n"
+    }
+  },
+  "checks": [
+    { "type": "final_matches", "pattern": "pass|passed|ok|success|exit.?0|succeeded" }
+  ],
+  "tags": ["verify", "outcome"]
+}

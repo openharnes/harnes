@@ -10,7 +10,7 @@ export interface McpToolProvider {
   /** read/write/unknown classification for a namespaced tool, used for permission gating. */
   classify(namespacedName: string): McpToolClass;
   /** Calls a namespaced tool. Connection/call failures are returned as an error string, never thrown. */
-  callTool(namespacedName: string, args: Record<string, string>): Promise<string>;
+  callTool(namespacedName: string, args: Record<string, unknown>): Promise<string>;
   /** Per-server status for the `/mcp` slash command. Connects lazily if not already connected. */
   describeStatus(): Promise<McpServerStatus[]>;
   close(): Promise<void>;
@@ -105,7 +105,7 @@ export class McpManager implements McpToolProvider {
     return def ? classifyMcpTool(def) : "unknown";
   }
 
-  async callTool(namespacedName: string, args: Record<string, string>): Promise<string> {
+  async callTool(namespacedName: string, args: Record<string, unknown>): Promise<string> {
     const parsed = this.parseName(namespacedName);
     if (!parsed) {
       return `Tool error: '${namespacedName}' is not a valid mcp__<server>__<tool> name.`;
@@ -166,7 +166,18 @@ export class McpManager implements McpToolProvider {
   private async ensureConnected(name: string): Promise<void> {
     const state = this.servers.get(name);
     if (!state) throw new Error(`No MCP server named '${name}' is configured.`);
-    if (state.client) return;
+    if (state.client?.alive) return;
+    // Dead child: drop so the next connect can respawn.
+    if (state.client && !state.client.alive) {
+      try {
+        await state.client.close();
+      } catch {
+        /* ignore */
+      }
+      state.client = undefined;
+      state.tools = undefined;
+      state.connecting = undefined;
+    }
     if (!state.connecting) {
       const client = new McpStdioClient(name, state.config);
       state.connecting = client
@@ -174,6 +185,7 @@ export class McpManager implements McpToolProvider {
         .then(() => {
           state.client = client;
           state.error = undefined;
+          state.connecting = undefined;
         })
         .catch((error) => {
           state.error = errorMessage(error);
@@ -188,8 +200,12 @@ export class McpManager implements McpToolProvider {
     if (!namespacedName.startsWith(MCP_TOOL_PREFIX)) return undefined;
     const rest = namespacedName.slice(MCP_TOOL_PREFIX.length);
     const sep = rest.indexOf("__");
-    if (sep === -1) return undefined;
-    return { server: rest.slice(0, sep), tool: rest.slice(sep + 2) };
+    if (sep <= 0) return undefined;
+    const server = rest.slice(0, sep);
+    const tool = rest.slice(sep + 2);
+    // Server names must not contain "__" (ambiguous with the separator).
+    if (!server || !tool || server.includes("__")) return undefined;
+    return { server, tool };
   }
 }
 

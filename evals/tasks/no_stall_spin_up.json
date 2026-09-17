@@ -1,0 +1,16 @@
+{
+  "id": "no_stall_spin_up",
+  "description": "Must act (list/read) not only narrate when asked to spin up an app",
+  "prompt": "Can we spin up the app in this folder please? Inspect the files first.",
+  "expect": [{ "name": "list_dir" }],
+  "setup": {
+    "files": {
+      "index.html": "<h1>hi</h1>\n",
+      "package.json": "{\n  \"name\": \"demo-app\",\n  \"version\": \"0.0.1\"\n}\n"
+    }
+  },
+  "checks": [
+    { "type": "final_matches", "pattern": "index\\.html|package\\.json|demo-app|html" }
+  ],
+  "tags": ["explore", "stall_regression", "outcome"]
+}

@@ -1,0 +1,8 @@
+{
+  "id": "abstain_hello",
+  "description": "Chit-chat should not call tools",
+  "prompt": "Hey, how's it going?",
+  "expect": [],
+  "checks": [{ "type": "final_matches", "pattern": "." }],
+  "tags": ["abstain", "outcome"]
+}

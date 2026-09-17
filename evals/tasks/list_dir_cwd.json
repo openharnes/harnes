@@ -1,0 +1,14 @@
+{
+  "id": "list_dir_cwd",
+  "description": "Explore current folder → list_dir, then report files",
+  "prompt": "What files are in the current directory? List them by name.",
+  "expect": [{ "name": "list_dir" }],
+  "setup": {
+    "files": {
+      "alpha.txt": "a\n",
+      "beta.txt": "b\n"
+    }
+  },
+  "checks": [{ "type": "final_matches", "pattern": "alpha(\\.txt)?" }],
+  "tags": ["explore", "outcome"]
+}
